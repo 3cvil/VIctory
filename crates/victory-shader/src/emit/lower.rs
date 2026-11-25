@@ -614,13 +614,13 @@ fn lane_uniform(
                     _ => continue,
                 };
                 // the thread id's x shifted past the console wave: one value per console wave
-                // (an inline constant 6..64: operand codes 134..192)
+                // The b32 instruction uses only the low five bits of the shift count.
                 if let (
                     Some(tid),
                     "v_lshrrev_b32",
-                    [Operand::Const(k), Operand::Vector { reg, .. }, ..],
+                    [Operand::Const(k @ 128..=192), Operand::Vector { reg, .. }, ..],
                 ) = (wave_tid, name, ops.as_slice())
-                    && (134..=192).contains(k)
+                    && ((k - 128) & 31) >= 6
                     && inst.read(Reg::V(*reg)) == Some(tid)
                 {
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
