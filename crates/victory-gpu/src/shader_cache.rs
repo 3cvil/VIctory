@@ -85,6 +85,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_LDS_FLAGS",
             "VICTORY_WAVE_ZERO_MASK",
+            "VICTORY_BVH_MISS",
             "VICTORY_F16_NEAREST",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
