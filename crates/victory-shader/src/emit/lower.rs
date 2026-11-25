@@ -3052,6 +3052,15 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            // SCC of a mask operation read straight as data (`s_cselect` after `s_and exec`):
+            // "some lane of the wave has the bit", asked where the operation stands.
+            Some(&Val::Missing(_)) | None
+                if self.mask_data == MaskData::Console && self.x.st.scc_some.contains_key(&v) =>
+            {
+                let x = self.scc_some(v)?;
+                self.vals.insert(v, Val::Bit(x));
+                return Ok(Val::Bit(x));
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -9061,7 +9070,7 @@ impl<'a> Lower<'a> {
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
-            "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
+            "fmac_f16" | "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
@@ -9089,6 +9098,22 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if op == "fmac_f16" {
+                // The accumulator is the destination's own half.
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    x
+                };
+                let m = self.s.m.i32(0xFFFF);
+                let x = self.s.m.bin(c, Bin::And, x, m);
+                xs.push(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]));
             }
             let r = if float {
                 let mut f = match op {
