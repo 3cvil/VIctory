@@ -8478,6 +8478,83 @@ impl Host {
         }
     }
 
+    /// Whether the device has GPU upload heaps in its own memory (a resizable
+    /// BAR and `D3D12_OPTIONS16.GPUUploadHeapSupported`; vendor-neutral). Asked
+    /// once, said in the log.
+    pub(crate) fn mapped_card_memory(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: plain queries into local structures.
+            let (supported, local) = unsafe {
+                let supported = self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                    && options.GPUUploadHeapSupported.as_bool();
+                let local = supported
+                    && self.device.GetCustomHeapProperties(0, D3D12_HEAP_TYPE_GPU_UPLOAD).MemoryPoolPreference
+                        == D3D12_MEMORY_POOL_L1;
+                (supported, local)
+            };
+            tracing::info!(supported, local, "card memory the CPU maps (GPU upload heaps)");
+            local
+        })
+    }
+
+    /// A buffer in the card's own memory that the CPU maps
+    /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) and shaders read and may write, in the
+    /// common state; `None` without [`Self::mapped_card_memory`]. The CPU
+    /// should only write it: a read of the mapping crosses the bus a few
+    /// bytes at a time (8 MB/s measured on a laptop RTX 4060, writes 1.3
+    /// GB/s on one thread).
+    pub(crate) fn mapped_card_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.mapped_card_memory() {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        let no_reads = D3D12_RANGE { Begin: 0, End: 0 };
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, Some(&raw const no_reads), Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
+                None
+            }
+        }
+    }
+
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {

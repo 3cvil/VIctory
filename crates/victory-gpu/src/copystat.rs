@@ -798,6 +798,17 @@ fn log_memory() {
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.
+    let bar = crate::shadow::window_mapped_stats();
+    if bar[1] + bar[2] > 0 {
+        tracing::info!(
+            "memory, windows in card memory the CPU maps (VICTORY_WINDOWS_BAR_MB): {:.0} MB alive, {} made and {} \
+             refused for the card's budget since the start, {} snapshots read through the bus",
+            mb(bar[0]),
+            bar[1],
+            bar[2],
+            bar[3],
+        );
+    }
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
     let views = crate::descriptor::views_kept();
