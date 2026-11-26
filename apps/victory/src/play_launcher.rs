@@ -252,6 +252,11 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
         child.env("VICTORY_DEBUG_HUD", "1");
     }
+    // The title's watchdog ends the run when paging stalls the main thread.
+    // The hook is byte-checked and hash-gated; set the variable to 0 to opt out.
+    if std::env::var_os("VICTORY_NO_WATCHDOG").is_none() {
+        child.env("VICTORY_NO_WATCHDOG", "1");
+    }
     child
         .current_dir(folder)
         .env("VICTORY_DATA_DIR", &state)
