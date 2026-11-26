@@ -57,6 +57,34 @@ pub(crate) fn texture_mip_drop_min_size() -> u64 {
     })
 }
 
+/// The smallest a mip-dropped host copy's top level may be, in texels each
+/// way (`VICTORY_TEXTURE_MIP_DROP_FLOOR`, 16 to 4096; unset: no floor
+/// beyond the size gate). From `KevinPratap/ApexIV` (29218ff and later).
+pub(crate) fn texture_mip_drop_floor() -> Option<u64> {
+    static FLOOR: OnceLock<Option<u64>> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_FLOOR")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(16, 4096))
+    })
+}
+
+/// The largest a mip-dropped host copy's top level may stay, in texels on
+/// its larger side (`VICTORY_TEXTURE_MIP_CAP`, 64 to 16384; unset: none).
+/// Only as many levels (at most `VICTORY_TEXTURE_MIP_DROP`) as bring a
+/// texture to the cap are left off, and one at or under it stays whole.
+/// From `KevinPratap/ApexIV` (73ca53c).
+pub(crate) fn texture_mip_cap() -> Option<u64> {
+    static CAP: OnceLock<Option<u64>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_CAP")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(64, 16384))
+    })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();

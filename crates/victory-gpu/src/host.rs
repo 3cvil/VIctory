@@ -2837,9 +2837,20 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most.saturating_mul(2) } else { most }
+}
+
+/// Whether the flight-list and merge-run budgets are widened (twice
+/// `VICTORY_LATE_WAIT_LISTS`, eight times the 512 changed runs merged
+/// under flights) so fewer flights settle (`VICTORY_SETTLE_ROOM=1`; off by
+/// default). From `KevinPratap/ApexIV` ddf5990 (itself from
+/// `fxceless/victory-fork` `06702fe86`).
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v == "1"))
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3238,7 +3249,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = if settle_room() { 4096 } else { 512 };
         return spans.refreshes.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.refreshes.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
