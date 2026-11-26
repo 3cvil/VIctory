@@ -25,6 +25,25 @@ fn shifted_thread_ids_are_uniform_only_when_every_lane_agrees() {
 }
 
 #[test]
+fn a_swap_also_depends_on_its_old_destination() {
+    use crate::ir::Reg;
+    let words = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E00_CB01, // v_swap_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let p = ir::build(&code, true, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let swap = &p.blocks[0].insts[1];
+    assert_eq!(swap.name(), "v_swap_b32");
+    let old_v0 = swap.read(Reg::V(0)).unwrap();
+    let new_v1 = swap.write(Reg::V(1)).unwrap();
+    let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0));
+    assert!(!uniform.contains(&new_v1));
+}
+
+#[test]
 fn packed_pixel_inputs_find_their_second_row() {
     use super::super::container::SigElement;
     use super::half_input_partners;
