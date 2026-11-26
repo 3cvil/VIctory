@@ -278,6 +278,42 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// The RAM band the sweeps work in (`ram_band` over a fresh sample, kept
+/// between calls so one sample near a watermark does not toggle it).
+/// `VICTORY_RAM_SWEEP=0` keeps it Calm: the sweeps then behave as before.
+#[cfg(windows)]
+pub(crate) fn sweep_band() -> RamBand {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static BAND: std::sync::Mutex<RamBand> = std::sync::Mutex::new(RamBand::Calm);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RAM_SWEEP").is_none_or(|v| v != "0")) {
+        return RamBand::Calm;
+    }
+    let mut band = BAND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((working, private, free, commit, total, limit)) = ram_sample() {
+        *band = ram_band(*band, working, private, free, commit, total, limit);
+    }
+    *band
+}
+
+/// Idle time (ms) after which a sweep may let go of an unused copy in `band`,
+/// never longer than `ms` and never below 2 s (a handle not yet recorded
+/// into a list or slot is protected by idle time alone).
+pub(crate) fn band_idle_ms(band: RamBand, ms: u64) -> u64 {
+    match band {
+        RamBand::Calm => ms,
+        RamBand::Watch => ms.min(5_000),
+        RamBand::High => ms.min(2_000),
+    }
+}
+
+/// Idle frames a sweep asks for in `band`. In the High band the frame
+/// count is not asked for: a title loading with few or no presented frames
+/// never ages anything by frames, and its copies pile up (the idle time
+/// still protects handles in flight).
+pub(crate) fn band_frames(band: RamBand, frames: u64) -> u64 {
+    if band == RamBand::High { 0 } else { frames }
+}
+
 /// Low-RAM threshold (`VICTORY_RAM_TRIM_MB`, in MiB; off by default):
 /// while the machine's available physical memory is below it, [`sweep`]
 /// runs twice as often and trims the pool of idle host lists
@@ -8841,6 +8877,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             ram_band(RamBand::Calm, 4452 * M, 10191 * M, 16047 * M, 154 * M, 32 * 1024 * M, 11 * 1024 * M),
             RamBand::High
         );
+    }
+
+    #[test]
+    fn band_sweeps_tighten_only_under_pressure() {
+        use crate::host::{band_frames, band_idle_ms};
+        assert_eq!(band_idle_ms(RamBand::Calm, 10_000), 10_000);
+        assert_eq!(band_idle_ms(RamBand::Watch, 10_000), 5_000);
+        assert_eq!(band_idle_ms(RamBand::High, 10_000), 2_000);
+        assert_eq!(band_idle_ms(RamBand::High, 1_000), 1_000, "never longer than asked");
+        assert_eq!(band_frames(RamBand::Calm, 4), 4);
+        assert_eq!(band_frames(RamBand::Watch, 4), 4);
+        assert_eq!(band_frames(RamBand::High, 4), 0);
     }
 
     #[test]

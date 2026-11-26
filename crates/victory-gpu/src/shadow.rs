@@ -1802,9 +1802,13 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
+    let sweep_band = crate::host::sweep_band();
+    let idle_frames = crate::host::band_frames(sweep_band, 4);
     let budget = window_budget();
-    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = crate::host::band_idle_ms(
+        sweep_band,
+        crate::host::ram_idle_ms(crate::host::available_physical_ram()),
+    );
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
@@ -1834,11 +1838,32 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
             .collect();
+        if keep != u64::MAX {
+            // Why a budget may not hold: what no sweep may take (a list, a
+            // pass over the heap or a descriptor slot still names it, or it
+            // was used lately) counts against it all the same.
+            let (mut total, mut lists, mut slots) = (0u64, 0u64, 0u64);
+            for s in map.values() {
+                total += s.len;
+                if Arc::strong_count(s) > 1 {
+                    lists += s.len;
+                } else if crate::host::references(&s.buffer) > 1 {
+                    slots += s.len;
+                }
+            }
+            let can: u64 = eligible.iter().map(|e| e.3).sum();
+            crate::host::trail(|| {
+                format!(
+                    "window budget {} MB: {} MB of windows, {} MB named by lists, {} MB by slots, {} MB idle and free to go",
+                    keep >> 20, total >> 20, lists >> 20, slots >> 20, can >> 20
+                )
+            });
+        }
         let victims: Vec<usize> = if keep == u64::MAX {
             (0..eligible.len()).collect()
         } else {
