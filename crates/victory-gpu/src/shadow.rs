@@ -1743,6 +1743,50 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
+/// keeps today's sweep. A positive value caps the copies only in the Watch
+/// and High RAM bands; Calm is unchanged.
+fn window_budget() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v.saturating_mul(1 << 20))
+    })
+}
+
+/// Oldest eligible copies to remove until their unique bytes fit `keep`.
+/// Entries are `(last-used moment, bytes, unique copy identity)`, already
+/// sorted oldest first; one copy standing under several keys counts once.
+fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
+    let mut left = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    for &(_, bytes, id) in entries {
+        if seen.insert(id) {
+            left = left.saturating_add(bytes);
+        }
+    }
+    let mut out = Vec::new();
+    for (i, &(_, bytes, id)) in entries.iter().enumerate() {
+        if left <= keep {
+            break;
+        }
+        if seen.remove(&id) {
+            left = left.saturating_sub(bytes);
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Kept between sweeps so one sample near a watermark does not toggle the
+/// policy on the next submission.
+static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
+    std::sync::Mutex::new(crate::host::RamBand::Calm);
+
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -1758,7 +1802,31 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
+    let sweep_band = crate::host::sweep_band();
+    let idle_frames = crate::host::band_frames(sweep_band, 4);
+    let budget = window_budget();
+    let mut idle_ms = crate::host::band_idle_ms(
+        sweep_band,
+        crate::host::ram_idle_ms(crate::host::available_physical_ram()),
+    );
+    let mut keep = u64::MAX;
+    if let Some(bytes) = budget
+        && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
+    {
+        let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
+        match *band {
+            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Watch => {
+                idle_ms = idle_ms.min(10_000);
+                keep = bytes;
+            }
+            crate::host::RamBand::High => {
+                idle_ms = idle_ms.min(2_000);
+                keep = bytes / 2;
+            }
+        }
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -1766,17 +1834,44 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
-            .map(|(key, _)| *key)
+            .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        if keep != u64::MAX {
+            // Why a budget may not hold: what no sweep may take (a list, a
+            // pass over the heap or a descriptor slot still names it, or it
+            // was used lately) counts against it all the same.
+            let (mut total, mut lists, mut slots) = (0u64, 0u64, 0u64);
+            for s in map.values() {
+                total += s.len;
+                if Arc::strong_count(s) > 1 {
+                    lists += s.len;
+                } else if crate::host::references(&s.buffer) > 1 {
+                    slots += s.len;
+                }
+            }
+            let can: u64 = eligible.iter().map(|e| e.3).sum();
+            crate::host::trail(|| {
+                format!(
+                    "window budget {} MB: {} MB of windows, {} MB named by lists, {} MB by slots, {} MB idle and free to go",
+                    keep >> 20, total >> 20, lists >> 20, slots >> 20, can >> 20
+                )
+            });
+        }
+        let victims: Vec<usize> = if keep == u64::MAX {
+            (0..eligible.len()).collect()
+        } else {
+            eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+            let entries: Vec<(u64, u64, usize)> = eligible.iter().map(|&(used, _, id, len)| (used, len, id)).collect();
+            window_victims(&entries, keep)
+        };
+        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3387,7 +3482,28 @@ fn refresh_remembers_writes_newer_than_the_submission_query() {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of, window_victims};
+
+    #[test]
+    fn window_budget_evicts_oldest_only_until_it_fits() {
+        const M: u64 = 1 << 20;
+        // Oldest first: 10, 20 and 30 MiB. Keeping 50 MiB must free only the
+        // oldest copy (60 MiB left before, 50 MiB after).
+        let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
+        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
+        // A tighter cap takes the newest as well.
+        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn window_budget_counts_one_copy_under_several_keys_once() {
+        const M: u64 = 1 << 20;
+        // The first two entries are one copy; 50 MiB is live, not 80.
+        // Without dedupe both would be picked to reach a 40 MiB cap.
+        let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
+        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+    }
+
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.

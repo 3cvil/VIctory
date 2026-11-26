@@ -1,7 +1,9 @@
 //! Diagnostics: where the submission copies of title memory go (which
 //! ranges, how often, of what memory) and what limits their rate, logged
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
-//! mapped-page guard, `none` skips the copies (both for timing only).
+//! mapped-page guard, `none` skips the copies (both for timing only). Set
+//! `VICTORY_MEMORY_CATEGORIES=1` for one extra periodic line that gathers the
+//! memory categories already counted here into one approximation.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -281,6 +283,20 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// ours. Bigger blocks are allocations of their own in the map.
 static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Formats already-collected byte counts for the optional category line.
+/// Values are not summed here: several categories overlap, so only the
+/// individual numbers are meaningful.
+fn category_text(fields: &[(&str, u64)]) -> String {
+    let mut out = String::new();
+    for (name, bytes) in fields {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{name} {:.0} MB", *bytes as f64 / (1 << 20) as f64));
+    }
+    out
+}
+
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
     match size {
@@ -410,8 +426,14 @@ mod command_tests {
 
 #[cfg(test)]
 mod own_tests {
-    use super::{OWN, block_class};
+    use super::{OWN, block_class, category_text};
     use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn the_category_line_formats_megabytes() {
+        let fields = [("first", 1u64 << 20), ("zero", 0), ("last", 5u64 << 20)];
+        assert_eq!(category_text(&fields), "first 1 MB, zero 0 MB, last 5 MB");
+    }
 
     #[test]
     fn blocks_count_in_their_size_class() {
@@ -489,6 +511,12 @@ fn system_memory() -> (u64, u64) {
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+}
+
+/// Whether to print the optional one-line category summary. Off by default.
+fn memory_categories() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CATEGORIES").is_some_and(|v| v != "0"))
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
@@ -873,6 +901,40 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    if memory_categories() {
+        let fields: &[(&str, u64)] = &[
+            ("working set", working),
+            ("private total", private),
+            ("free physical", free),
+            ("commit headroom", left),
+            ("host lists alive", alive[0]),
+            ("lists never reset", lists[3]),
+            ("list scratch live", alive[2]),
+            ("list scratch spare", alive[4]),
+            ("list other uploads", alive[7]),
+            ("private growth making lists", (lists[2] as i64).max(0) as u64),
+            ("title window copies", copies[3]),
+            ("window pages copied", window[0]),
+            ("window held by lists", window[4]),
+            ("window without a length", window[6]),
+            ("texture host copies", census[1]),
+            ("texture title-fill copies", census[5]),
+            ("live texture staging", staged[1]),
+            ("host textures", textures[1]),
+            ("descriptor views", views[2]),
+            ("shader containers", kept[1]),
+            ("translations", kept[3]),
+            ("pipeline library file", kept[4]),
+            ("our rust heap", own[..4].iter().sum()),
+            ("made upload buffers so far", made[1]),
+            ("made shared buffers so far", made[3]),
+            ("made card buffers so far", made[5]),
+        ];
+        tracing::info!(
+            "memory by category (VICTORY_MEMORY_CATEGORIES=1, approximate and overlapping, not a sum): {}",
+            category_text(fields)
+        );
+    }
 }
 
 /// Microseconds since the first call.

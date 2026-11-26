@@ -1845,14 +1845,18 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
     let video = crate::host::host().and_then(|h| h.video_memory());
-    let idle_ms = crate::host::vram_idle_ms(video);
-    let mut reuse_budget = texture_reuse_budget(video);
+    // Under system-RAM pressure (`crate::host::sweep_band`) the card's
+    // copies go sooner, frames or not, and none is kept for reuse: the
+    // commit they hold is what the machine runs out of.
+    let band = crate::host::sweep_band();
+    let idle_frames = crate::host::band_frames(band, 4);
+    let idle_ms = crate::host::band_idle_ms(band, crate::host::vram_idle_ms(video));
+    let mut reuse_budget = if band == crate::host::RamBand::High { 0 } else { texture_reuse_budget(video) };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1868,7 +1872,7 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let used = r.host.used.load(Relaxed);
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+                if !crate::host::long_ago(used, idle_ms, idle_frames)
                     || std::sync::Arc::strong_count(host) != 1
                     || crate::host::references(&host.texture) != 1
                 {
@@ -1876,7 +1880,7 @@ pub(crate) fn let_go_idle() {
                 }
                 let reused_placed = r.host.gone.load(Relaxed) && r.host.placed.load(Relaxed);
                 if reused_placed && reuse_budget != 0 && host.bytes() <= reuse_budget
-                    && !crate::host::long_ago(used, 3 * idle_ms, IDLE_FRAMES)
+                    && !crate::host::long_ago(used, 3 * idle_ms, idle_frames)
                 {
                     reuse_budget -= host.bytes();
                     return false;
@@ -2260,6 +2264,11 @@ fn host_texture(
     // A mip-dropped host texture: the title's mip `mip_drop` is its mip 0.
     if mip_drop > 0 {
         apply_mip_drop(&mut d, desc, u32::from(mip_drop));
+        static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(256) {
+            tracing::info!(n, mip_drop, width = desc.width, height = desc.height, "host textures made with mips dropped so far");
+        }
     }
     // SAFETY: as above.
     let native: &D3D12_RESOURCE_DESC = unsafe { &*(&raw const d).cast() };
