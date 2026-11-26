@@ -2609,6 +2609,7 @@ impl HostHeap {
                 None
             } else {
                 let ahead = queued_write.map_or(AheadView::Normal, AheadView::Queue);
+                let _ = crate::resource::take_refused_for_memory();
                 make(&view, self.cpu(index), &mut sparse, true, ahead)
             };
             if let Some(sample) = sparse {
@@ -2618,6 +2619,19 @@ impl HostHeap {
             made[index as usize] = if later { 0 } else { key };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                // Its texture is asked for again once the host may have
+                // room (`resource::hosted`): the slot is not noted as made,
+                // so the next draw that reads it makes it again, and it
+                // waits for the texture's host copy like a slot written
+                // before the texture's first use (`super::make_waiting`):
+                // made null for good, a slot shaders read only through the
+                // heap stayed null.
+                if !later && crate::resource::take_refused_for_memory() {
+                    made[index as usize] = 0;
+                    if let Some(texture) = view.waiting_texture() {
+                        super::wait_for(texture, handle);
+                    }
+                }
             }
             self.keep(index, kept.flatten());
         }
