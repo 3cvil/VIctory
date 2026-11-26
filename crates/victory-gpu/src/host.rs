@@ -3613,6 +3613,7 @@ fn late_line(frames: f64) {
             );
         }
     }
+    crate::port::log(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -6896,6 +6897,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -6903,6 +6905,9 @@ impl HostList {
                 }
                 Step::Fill(_) | Step::Fills(_) => {
                     let fills = step.fills();
+                    for f in fills {
+                        crate::port::filled(f.src, f.len);
+                    }
                     let bytes = fills.iter().map(|f| f.len).sum::<usize>();
                     let jobs = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]

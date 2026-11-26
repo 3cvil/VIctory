@@ -39,6 +39,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod material_demand;
+#[cfg(windows)]
+mod port;
 pub mod list;
 pub mod object;
 pub mod pipeline;
