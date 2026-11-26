@@ -535,6 +535,8 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
+                    // Compile workers live on the efficiency cores (hybrid CPUs).
+                    crate::cores::keep_on_efficiency_cores("victory-pipelines");
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
