@@ -653,7 +653,19 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // M1LK: on hybrid laptops the default adapter can be the iGPU.
+            // Ask DXGI for the high-performance one (VICTORY_ADAPTER=<index|name>
+            // overrides); any failure falls back to the default adapter.
+            let mut created = false;
+            if let Some(adapter) = pick_hardware_adapter() {
+                match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                    Ok(()) => created = true,
+                    Err(e) => tracing::warn!(error = %e, "chosen adapter refused a device; using the default adapter"),
+                }
+            }
+            if !created {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -767,6 +779,68 @@ impl Host {
 /// builds with `VICTORY_D3D12_WARP`.
 pub(crate) fn on_warp() -> bool {
     cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+}
+
+/// Adapter name from a DXGI description (UTF-16, NUL terminated).
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..n])
+}
+
+/// Pick the host's hardware adapter: `VICTORY_ADAPTER=<index|name substring>`
+/// when set, else `IDXGIFactory6::EnumAdapterByGpuPreference(HIGH_PERFORMANCE)`.
+/// Logs the choice (name and VRAM). `None` means "use the default adapter".
+fn pick_hardware_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let wanted = std::env::var("VICTORY_ADAPTER").ok().filter(|v| !v.trim().is_empty());
+        let mut picked: Option<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> = None;
+        if let Some(want) = wanted.as_deref() {
+            let want = want.trim();
+            let index = want.parse::<u32>().ok();
+            let lower = want.to_lowercase();
+            let mut i = 0u32;
+            while let Ok(a) = factory.EnumAdapters1(i) {
+                if let Ok(d) = a.GetDesc1() {
+                    let soft = d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                    let hit = match index {
+                        Some(n) => n == i,
+                        None => adapter_name(&d).to_lowercase().contains(&lower),
+                    };
+                    if hit && !soft {
+                        picked = Some((a, d));
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if picked.is_none() {
+                tracing::warn!(want, "VICTORY_ADAPTER matched no hardware adapter; using the high-performance one");
+            }
+        }
+        if picked.is_none() {
+            let mut i = 0u32;
+            while let Ok(a) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+                if let Ok(d) = a.GetDesc1()
+                    && d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                {
+                    picked = Some((a, d));
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let (a, d) = picked?;
+        tracing::info!(
+            name = %adapter_name(&d),
+            vram_mb = d.DedicatedVideoMemory / (1 << 20),
+            shared_mb = d.SharedSystemMemory / (1 << 20),
+            vendor = format_args!("{:#x}", d.VendorId),
+            "host adapter chosen (VICTORY_ADAPTER=<index|name> overrides)"
+        );
+        Some(a)
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
