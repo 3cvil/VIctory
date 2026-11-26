@@ -153,6 +153,15 @@ pub fn warm_selected(stage: &'static str, container: &[u8], compute: bool) -> Op
     Some((translated, made))
 }
 
+/// Makes the host pipelines of the graphics pipelines earlier runs wrote
+/// down (see `book`) on `threads` threads, for the caches on disk; `done`
+/// is called after each. Returns (listed, made, refused).
+#[cfg(windows)]
+pub fn warm_book(threads: usize, done: &(dyn Fn() + Sync)) -> (usize, usize, usize) {
+    let m = book::make_all(threads, done);
+    (m.listed, m.made, m.refused)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -776,6 +785,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod book;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]

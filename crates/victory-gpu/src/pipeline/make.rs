@@ -251,6 +251,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if let Some(g) = p.graphics.as_deref() {
+            super::book::note(&p.key, &p.shaders, g);
+        }
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -525,12 +528,24 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many pipeline workers: `VICTORY_PIPELINE_WORKERS` (1 to 32), else
+/// five eighths of the logical processors, 2 to 10 (10 of 16): the drivers
+/// compile on whatever threads they are given, and with eight of sixteen
+/// the thousands of pipelines of a world's first minutes waited for four
+/// of the cores that were idle.
+fn worker_count() -> usize {
+    if let Some(n) = std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 32);
+    }
+    std::thread::available_parallelism().map_or(2, |n| (n.get() * 5 / 8).clamp(2, 10))
+}
+
+/// Starts the workers (see [`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
