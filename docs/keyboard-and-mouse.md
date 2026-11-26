@@ -20,7 +20,7 @@ The title reads a gamepad and a keyboard. It does not ask for a mouse. With no c
 | Esc | Menu |
 | Tab | View |
 
-While the stand-in pad is in use and the game window has focus, mouse look keeps the cursor in the middle of the window. Switching to another window releases it.
+The cursor starts free. Left-click in the game window to start mouse look, which keeps the cursor in the middle of the window. Press F8 to release the cursor; switching to another window releases it too.
 
 ## Settings
 

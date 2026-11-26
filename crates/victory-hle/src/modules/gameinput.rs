@@ -1417,15 +1417,18 @@ mod host {
             if !focused() {
                 self.look = (0.0, 0.0);
                 self.centred = None;
+                MOUSE_CAPTURED.store(false, Ordering::Relaxed);
                 return Mouse::default();
             }
-            let buttons = [0x01_u8, 0x02, 0x04, 0x05, 0x06]
+            let buttons: Vec<u8> = [0x01_u8, 0x02, 0x04, 0x05, 0x06]
                 .into_iter()
                 // SAFETY: plain queries.
                 .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                 .collect();
             let (mut dx, mut dy) = (0.0, 0.0);
-            if mouse_look() {
+            if !captured(buttons.contains(&0x01)) {
+                self.centred = None;
+            } else if mouse_look() {
                 let now = Instant::now();
                 let mut rect = RECT {
                     left: 0,
@@ -1547,6 +1550,26 @@ mod host {
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
+    /// Whether mouse look holds the cursor. It starts free: a left click in the
+    /// focused window takes it, F8 lets it go again, and losing focus frees it.
+    static MOUSE_CAPTURED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn captured(left_down: bool) -> bool {
+        static F8_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // SAFETY: plain query.
+        let f8 = unsafe { GetAsyncKeyState(0x77) } < 0;
+        if f8 && !F8_DOWN.swap(true, Ordering::Relaxed) {
+            MOUSE_CAPTURED.store(false, Ordering::Relaxed);
+        } else if !f8 {
+            F8_DOWN.store(false, Ordering::Relaxed);
+            if left_down {
+                MOUSE_CAPTURED.store(true, Ordering::Relaxed);
+            }
+        }
+        MOUSE_CAPTURED.load(Ordering::Relaxed)
+    }
+
     /// `VICTORY_MOUSE_LOOK=0` leaves the cursor alone: no mouse look.
     fn mouse_look() -> bool {
         static ON: LazyLock<bool> =
