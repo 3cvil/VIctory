@@ -273,6 +273,13 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// A console wave64 program with branches the wave takes together, run as two host waves
+    /// that exchange ([`Structured::wide`], `exchange`): the title's LDS dwords and the dword
+    /// its accesses past them go to. The console drops a write past a program's LDS and reads
+    /// 0 there; on the host such an access would reach the dwords the halves exchange their
+    /// decisions through, the halves would then go different ways and one would wait at a
+    /// barrier the other never reaches.
+    lds_guard: Option<(u32, u32)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -430,11 +437,16 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
-        // blocks reachable from the lane branch that do not post-dominate it
+        // blocks reachable from the lane branch that do not post-dominate it; and the branch's
+        // own block when a way from it comes back to it (a loop whose exit test closes its
+        // first block): the lanes that stayed run it again, the others do not
+        // (invariant: a block every lane runs is run by all of them together, once per pass;
+        // without this, such a loop's body counted as one, and the group barriers placed
+        // there met the other half's barriers of another trip)
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            if seen[b] || b != d && pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
             seen[b] = true;
@@ -917,6 +929,22 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut line = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in &block.insts {
+                        if matches!(i.fields, Fields::Ds { .. }) {
+                            line.push(format!("b{b}@{:#x} {}", i.machine.offset, i.name()));
+                        }
+                    }
+                }
+                eprintln!("WAVE64-WHY LDS region: {}", line.join(", "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -983,8 +1011,57 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`take_lds_region`].
+    static LDS_REGION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether a lowering on this thread since the last call kept 64-lane waves only because an
+/// LDS write and a read sit in one lane-branch region ([`lds_meetings`]), which it forgets:
+/// the programs whose branches around those regions [`super::widen`] may take wave-wide by
+/// default (`VICTORY_WAVE_WIDE=0`: never).
+pub(super) fn take_lds_region() -> bool {
+    LDS_REGION.replace(false)
+}
+
+/// The headers of the loops of `p` closed by a plain jump (no exit test on its back edge) that
+/// lie in a lane branch's region; none (an empty list) when no thread can leave `p` early while
+/// another goes on (`None`: an indirect exit, not followed). Lane branch regions as in
+/// ([`all_lane_blocks`]; the branches the wave takes together, [`Structured::wide`], and
+/// scalar ones count as taken together).
+///
+/// What the barrier forms of a console wave run as two host waves need so that they cannot
+/// hang: their group barriers (exchanges, LDS meetings, the title's own) stand only in blocks
+/// every lane runs, so every thread reaches each of them as often as the others, unless a
+/// thread leaves the program before. A lane's own `s_endpgm` puts the blocks after it in a
+/// lane region, where no barrier stands. A loop with an exit test leaves through its exit at
+/// [`LOOP_LIMIT`] and goes on to the same barriers. What is left is a loop closed by a plain
+/// jump: at the limit its lanes return from the program ([`Lower::abort_block`]). If every
+/// lane enters it together all of them count alike and return together; in a lane branch
+/// some threads could return while the others wait at a later barrier for them, until the
+/// device is reset.
+pub(super) fn loops_together(p: &crate::ir::Program, st: &Structured) -> Option<Vec<usize>> {
+    let all = all_lane_blocks(st)?;
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut place = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        place[b] = n;
+    }
+    let mut apart = Vec::new();
+    for (b, e) in st.exits.iter().enumerate() {
+        if let LaneExit::Jump(t) = *e
+            && place.get(b).is_some_and(|&from| from != usize::MAX && place[t] <= from)
+            && !all.get(t).copied().unwrap_or(false)
+            && !apart.contains(&t)
+        {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                let at = p.blocks[b].insts.last().map_or(0, |i| i.machine.offset);
+                eprintln!("WAVE64-WIDE a loop closed by a jump at {at:#x} (header {:#x}) in a lane branch", p.blocks[t].offset);
+            }
+            apart.push(t);
+        }
+    }
+    Some(apart)
+}
 /// As [`with_local_waves`], with every other use of a lane mask as a number
 /// and every lane read and write taken per host wave too: the program runs
 /// as it would on a console of 32-lane waves, lanes numbered 0..31 or
@@ -1290,6 +1367,7 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        let mut lds_guard: Option<(u32, u32)> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1354,6 +1432,7 @@ impl<'a> Lower<'a> {
                             lds_ok = true;
                         }
                         if !lds_ok {
+                            LDS_REGION.set(true);
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
                             for (b, blk) in p.blocks.iter().enumerate() {
@@ -1416,6 +1495,11 @@ impl<'a> Lower<'a> {
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
+                s.lds_dwords += 1;
+            }
+            if wave == 32 && x.native.wave64 && !x.st.wide.is_empty() && exchange.as_ref().is_some_and(|e| !e.1) {
+                // (`lds_guard`: the title's dwords, then one that takes its accesses past them)
+                lds_guard = Some((cs.lds_bytes() / 4, s.lds_dwords));
                 s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -1562,7 +1646,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
-            local: exchange.is_some() && LOCAL_WAVES.get(),
+            lds_guard,
+            local:exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
@@ -4603,14 +4688,42 @@ impl<'a> Lower<'a> {
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // With `lds_guard`, whether the dword at `bytes` past the address is the title's; an
+        // access past them goes to the guard's own dword, and a read there gives 0, as on the
+        // console (invariant: the dwords past the title's are only the translation's own).
+        let inside = |l: &mut Self, bytes: u32| -> Option<V> {
+            let (dwords, _) = l.lds_guard?;
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(dwords);
+            Some(l.s.m.cmp(c, pred::IULT, index, n))
+        };
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let c = l.cur;
+            let o = l.s.m.i32(bytes);
+            let at = l.s.m.bin(c, Bin::Add, a, o);
+            let two = l.s.m.i32(2);
+            let mut index = l.s.m.bin(c, Bin::LShr, at, two);
+            if let Some((dwords, sink)) = l.lds_guard {
+                let (n, k) = (l.s.m.i32(dwords), l.s.m.i32(sink));
+                let ok = l.s.m.cmp(c, pred::IULT, index, n);
+                index = l.s.m.select(c, ok, index, k);
+            }
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
+        };
+        // A value read at `bytes`: 0 past the title's dwords (`inside`).
+        let read_as = |l: &mut Self, bytes: u32, x: V| -> V {
+            match inside(l, bytes) {
+                Some(ok) => {
+                    let z = l.s.m.i32(0);
+                    l.s.m.select(l.cur, ok, x, z)
+                }
+                None => x,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4654,6 +4767,7 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let w = read_as(self, offset, w);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -4717,6 +4831,7 @@ impl<'a> Lower<'a> {
                 for k in 0..w {
                     let p = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let x = read_as(self, off + 4 * k, x);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4784,6 +4899,7 @@ impl<'a> Lower<'a> {
         } {
             let at = self.begin_guarded(guard);
             let r = self.lds_float_min_max(p, v0, max);
+            let r = read_as(self, offset, r);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
                 self.write(inst, Reg::V(reg), r, None);
@@ -4799,6 +4915,7 @@ impl<'a> Lower<'a> {
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
+        let r = read_as(self, offset, r);
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);

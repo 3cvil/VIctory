@@ -572,3 +572,183 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// The particle and water programs' idiom (369cbe906ea72764 at 0x494, 5dc3b25986622949 at
+/// 0x230-0x4c4): in a group of one console wave64, inside a per-lane branch, a lane writes
+/// LDS and another lane of the same wave reads it with no barrier between, relying on the
+/// wave's lockstep; then a loop closed by a plain jump (`s_branch` back, its exit an
+/// `s_cbranch_execz` inside) that lanes leave one by one, adding to an LDS counter at every
+/// trip, and a read of the counter after it. Lane t writes t to LDS[t], reads LDS[t ^ 32]
+/// (the other host half's lane), makes (t >> 4) + 1 trips (the halves leave the loop after
+/// different trips) and stores LDS[t ^ 32] + (trips << 16) + (all lanes' trips << 24).
+fn lds_in_a_lane_branch() -> NativeProgram {
+    let words = [
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xD834_0100,
+        0x0000_0807, // ds_write_b32 v7, v8 offset:256: the counter, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: the lanes below s0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_001F, // s_cbranch_execz to the end
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0x3A04_00A0, // v_xor_b32 v2, 32, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x2C0A_0084, // v_lshrrev_b32 v5, 4, v0
+        0x7E0C_0281, // v_mov_b32 v6, 1
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x4A08_0881, // head: v_add_nc_u32 v4, 1, v4
+        0xD800_0100,
+        0x0000_0607, // ds_add_u32 v7, v6 offset:256
+        0x7D88_0B04, // v_cmp_gt_u32 vcc, v4, v5
+        0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+        0xBF88_0001, // s_cbranch_execz to the loop's exit
+        0xBF82_FFF9, // s_branch head
+        0xBEFE_040E, // exit: s_mov_b64 exec, s[14:15]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0100,
+        0x0900_0007, // ds_read_b32 v9, v7 offset:256
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3408_0890, // v_lshlrev_b32 v4, 16, v4
+        0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+        0x3412_1298, // v_lshlrev_b32 v9, 24, v9
+        0x4A06_1303, // v_add_nc_u32 v3, v3, v9
+        0xE070_1000,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0xBEFE_040C, // end: s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native(&words);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// [`lds_in_a_lane_branch`]: kept on 64-lane waves per lane (the LDS write and read share a
+/// lane-branch region, `lower::take_lds_region`; its loop closed by a jump lies in that
+/// branch, [`lower::loops_together`]), translated by default for 32-lane waves, and on a card
+/// of 32-lane waves every lane reads what the other half's lane wrote, counts its own trips
+/// and reads every lane's.
+#[test]
+fn lds_shared_in_a_lane_branch_runs_on_two_host_waves() {
+    let native = lds_in_a_lane_branch();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    lower::take_lds_region();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let per_lane = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    let region = lower::take_lds_region();
+    let header = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.first().is_some_and(|i| i.name() == "v_add_nc_u32"))
+        .expect("the loop");
+    assert_eq!(lower::loops_together(&p, &st), Some(vec![header]));
+    // the whole translation
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).expect("container");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    assert!(per_lane.is_ok_and(|l| l.wave_size == Some(64)), "per lane: 64-lane waves");
+    assert!(region, "kept on 64 lanes for the LDS region");
+    let shader = shader.expect("translated");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    lds_in_a_lane_branch_on_the_card(&shader);
+}
+
+/// [`lds_in_a_lane_branch`] on a hardware device of 32-lane waves, against the console's
+/// results for 64, 48, 40 and 1 lanes in the branch.
+fn lds_in_a_lane_branch_on_the_card(shader: &HostShader) {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(shader).expect("a pipeline of 32-lane waves");
+    for below in [64u32, 48, 40, 1] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let total: u32 = (0..below).map(|l| (l >> 4) + 1).sum();
+        for t in 0..64u32 {
+            let got = out[0][t as usize];
+            let trips = (t >> 4) + 1;
+            if t >= below {
+                assert_eq!(got, 0, "lane {t} is outside the branch ({below} inside)");
+            } else if t ^ 32 < below {
+                let want = (t ^ 32) | trips << 16 | total << 24;
+                assert_eq!(got, want, "lane {t} of {below}: {got:#x}, the console's {want:#x}");
+            } else {
+                assert_eq!(got >> 16, trips | total << 8, "lane {t} of {below}: its trips and all lanes'");
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: every lane read the other half's write and every lane's trips");
+}
+
+/// The wave-wide form itself ([`super::widen`]'s) of [`lds_in_a_lane_branch`]: the branch
+/// around the LDS accesses and the loop's exit taken wave-wide, so that the wave enters and
+/// leaves the loop together (each half asks the other whether a lane is left), the halves
+/// meet before every LDS access, inside the loop too, as often as each other, and the result
+/// is the console's. (With the loop per lane the halves met at different trips: the read
+/// after it missed the upper half's last adds, 144 for 160.)
+#[test]
+fn lds_shared_in_a_lane_branch_taken_wave_wide_with_its_loop() {
+    let native = lds_in_a_lane_branch();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let entry = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let wide = HashSet::from([entry]);
+    let st = structure::structure_wide(&p, &wide).expect("structure");
+    let header = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.first().is_some_and(|i| i.name() == "v_add_nc_u32"))
+        .expect("the loop");
+    // the loop's exit test closes its first block, which the lanes that stay run again: a
+    // lane loop still, which `widen` takes wave-wide too
+    assert_eq!(lower::loops_together(&p, &st), Some(vec![header]));
+    assert_eq!(lower::branches_around(&st, &[header]), Some(vec![header]));
+    let wide = HashSet::from([entry, header]);
+    let st = structure::structure_wide(&p, &wide).expect("structure");    assert_eq!(lower::loops_together(&p, &st), Some(vec![]));
+    let shader = lowered(&native, &p, &wide).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    lds_in_a_lane_branch_on_the_card(&shader);
+}
