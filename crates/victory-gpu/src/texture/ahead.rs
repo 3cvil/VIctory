@@ -178,7 +178,7 @@ pub(crate) fn request(resource: This, copy: &Arc<HostTexture>, first: u32) -> St
 }
 
 fn eligible(resource: This, copy: &HostTexture, first: u32) -> bool {
-    if first != 0
+    if first > copy.first_kept_mip()
         || !crate::resource::ahead_eligible(resource)
         || copy.sparse.is_some()
         || copy.state.load(Acquire) != D3D12_RESOURCE_STATE_COMMON.0 as u32
@@ -265,7 +265,7 @@ fn prepare(staging: &Arc<Staging>, copy: &Arc<HostTexture>) -> Option<Job> {
         return None;
     }
     let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
-    if !last.has_data || last.first != 0 || !super::committed(staging.memory, size) {
+    if !last.has_data || last.first != copy.first_kept_mip() || !super::committed(staging.memory, size) {
         return None;
     }
     Some(Job {
@@ -273,7 +273,7 @@ fn prepare(staging: &Arc<Staging>, copy: &Arc<HostTexture>) -> Option<Job> {
             texture: copy.clone(),
             staging: staging.clone(),
             upload: last.sampled.as_ref()?.clone(),
-            first: 0,
+            first: last.first,
             activate_tiles: false,
             sparse_claim: None,
         },

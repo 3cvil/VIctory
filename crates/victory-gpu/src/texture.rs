@@ -28,6 +28,35 @@ use crate::object::This;
 pub(crate) mod ahead;
 mod upload;
 
+/// Number of top texture mip levels to drop on pure sampled textures to save VRAM
+/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`, default `0`).
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: OnceLock<u32> = OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_TEXTURE_MIP_DROP") {
+            let parsed = val.trim().parse::<u32>().unwrap_or(0).min(3);
+            if parsed > 0 {
+                tracing::info!(mip_drop = parsed, "texture mip drop enabled");
+            }
+            return parsed;
+        }
+        0
+    })
+}
+
+/// Minimum width and height a texture must have to qualify for mip dropping
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: OnceLock<u64> = OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -45,8 +74,12 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// The title's mips per array slice.
     mips: u32,
+    /// Number of top title mips dropped in the host texture
+    /// (`VICTORY_TEXTURE_MIP_DROP`): the host has `mips - mip_drop` per
+    /// slice.
+    mip_drop: u32,
     /// The first of them that is uploaded, and the bytes of title memory
     /// read for it and the smaller ones.
     first: u32,
@@ -731,6 +764,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 fn upload_texture(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32, sampled: bool) -> bool {
+    // The mips the host does not keep (`VICTORY_TEXTURE_MIP_DROP`) are never
+    // uploaded.
+    let first = first.max(crate::resource::existing_host_copy(resource).map_or(0, |c| c.first_kept_mip()));
     if ahead::enabled()
         && let Some(copy) = crate::resource::existing_host_copy(resource)
         && ahead::claim_normal(&copy) == ahead::Status::Pending
@@ -912,10 +948,11 @@ impl Staging {
         (self.first + i as u32 % mips, i as u32 / mips)
     }
 
-    /// The texture's subresource the `i`th part of the staging buffer is.
+    /// The host texture's subresource the `i`th part of the staging buffer
+    /// is (the title's mip `mip_drop` is the host's mip 0).
     fn subresource(&self, i: usize) -> u32 {
         let (mip, slice) = self.part(i);
-        slice * self.mips + mip
+        slice * (self.mips - self.mip_drop) + (mip - self.mip_drop)
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1540,6 +1577,11 @@ fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32)
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+    // A mip-dropped host texture lacks the title's first `mip_drop` mips; a
+    // reserved one keeps them unbacked (`VICTORY_TEXTURE_MIP_DROP`).
+    let (mip_drop, kept) = crate::resource::existing_host_copy(resource)
+        .map_or((0, 0), |c| (u32::from(c.mip_drop), c.first_kept_mip()));
+    let first = first.max(kept);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
@@ -1565,11 +1607,16 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+    // The title's mips: the host texture's and the dropped ones.
+    let mips = u32::from(d.MipLevels) + mip_drop;
+    let (staged, size) = staged_part(&layout, mips, first);
+    // Title memory from `staged` on is read; the mips before `kept` are
+    // never detiled.
+    let first = staged.max(kept);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - (first - mip_drop)
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1578,7 +1625,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            first - mip_drop,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1598,7 +1645,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         let padded = u64::from(f.RowPitch).checked_mul(u64::from(rows))?.checked_mul(u64::from(f.Depth))?;
         bytes = bytes.max(footprint.Offset.checked_add(padded)?);
     }
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -1608,7 +1655,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
+        mip_drop,
         first,
         size,
         bytes,
