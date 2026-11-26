@@ -18,12 +18,15 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+pub mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
 mod debug_hud;
 pub mod descriptor;
 pub mod device;
+#[cfg(windows)]
+pub mod dlss;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -62,6 +65,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+pub mod upscale;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

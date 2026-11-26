@@ -427,7 +427,11 @@ fn scheduler() -> Option<&'static Scheduler> {
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        // Hybrid CPUs: reads and decompression on the efficiency cores.
+                        victory_gpu::cores::keep_on_efficiency_cores("dstorage");
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();

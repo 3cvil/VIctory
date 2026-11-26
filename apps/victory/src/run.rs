@@ -32,8 +32,14 @@ pub fn run(
     let fsr = match std::env::var("VICTORY_FSR_4K").as_deref() {
         Ok("0") => None,
         Ok(name) => Some(FsrPreset::from_name(name).context("Unknown FSR preset")?),
-        Err(_) => (std::env::var("VICTORY_FSR_1440P_TO_4K").as_deref() == Ok("1"))
-            .then_some(FsrPreset::Quality),
+        // VICTORY_DLSS=quality|balanced|performance|ultra picks the scene scale
+        // the DLSS mode wants (2/3, 1/1.7, 1/2, 1/3 of 4K); without it, or with
+        // VICTORY_FSR_4K set, FSR keeps its own presets.
+        Err(_) => match std::env::var("VICTORY_DLSS").ok().as_deref().and_then(fsr_preset::dlss_preset) {
+            Some(preset) => Some(preset),
+            None => (std::env::var("VICTORY_FSR_1440P_TO_4K").as_deref() == Ok("1"))
+                .then_some(FsrPreset::Quality),
+        },
     };
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;

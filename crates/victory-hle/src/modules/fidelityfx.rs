@@ -244,7 +244,7 @@ pub fn use_host_dir(dir: Option<&Path>) {
 
 /// Whether the host's FidelityFX serves the title's.
 pub fn serving() -> bool {
-    HOST.get().is_some()
+    HOST.get().is_some() || victory_gpu::upscale::ours()
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -377,6 +377,10 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
+    // VICTORY_UPSCALER=spatial|dlss: our backend serves; otherwise AMD's DLL.
+    if victory_gpu::upscale::ours() {
+        return super::ffx_ours::create(context, desc.cast());
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -456,6 +460,9 @@ extern "C" fn ffxCreateContext(
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if victory_gpu::upscale::ours() {
+        return super::ffx_ours::destroy(context);
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -494,12 +501,18 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if victory_gpu::upscale::ours() {
+        return OK;
+    }
     // SAFETY: the title passes its context and descriptions.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if victory_gpu::upscale::ours() {
+        return super::ffx_ours::query(desc.cast());
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -532,6 +545,9 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if victory_gpu::upscale::ours() {
+        return super::ffx_ours::dispatch(context, desc.cast());
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
