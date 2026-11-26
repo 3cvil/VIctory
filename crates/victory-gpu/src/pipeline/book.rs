@@ -176,6 +176,7 @@ pub(crate) fn make_all(threads: usize, done: &(dyn Fn() + Sync)) -> Made {
                             _ => "compute",
                         },
                         hash: hash.to_owned(),
+                        hair: super::hair_strands(&bytes),
                         container: bytes,
                         translated: OnceLock::new(),
                         ray_work: OnceLock::new(),

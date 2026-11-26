@@ -2370,6 +2370,9 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
         return 0;
     }
     let min_size = crate::texture::texture_mip_drop_min_size();
+    if keeps_ui_whole(desc) {
+        return 0;
+    }
     let n = compute_mip_drop_explicit(desc, drop, min_size);
     mip_drop_limits(
         desc,
@@ -2377,6 +2380,21 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
         crate::texture::texture_mip_drop_floor(),
         crate::texture::texture_mip_cap(),
     )
+}
+
+/// Whether `desc` looks like 2D interface art (loading and menu pictures),
+/// which keeps all its levels: its chain stops short of a full one (world
+/// textures are authored with the whole chain down to 1x1; screen art is
+/// not). `VICTORY_TEXTURE_MIP_DROP_UI=1` drops such art as before.
+pub(crate) fn keeps_ui_whole(desc: &ResourceDesc) -> bool {
+    static DROP_UI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let drop_ui = *DROP_UI.get_or_init(|| std::env::var("VICTORY_TEXTURE_MIP_DROP_UI").is_ok_and(|v| v.trim() == "1"));
+    if drop_ui {
+        return false;
+    }
+    let side = desc.width.max(u64::from(desc.height)).max(1);
+    let full = 64 - side.leading_zeros();
+    mip_count(desc) < full
 }
 
 /// `n` levels to drop, held to a floor (the new top level at least that

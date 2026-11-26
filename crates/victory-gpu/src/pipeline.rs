@@ -61,6 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// A hair-strand program, left out ([`hair_strands`]).
+    #[cfg(windows)]
+    hair: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     #[cfg(windows)]
@@ -99,6 +102,39 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its entry-point name (ported from the cool_fox fork). Some
+/// do not translate (an address from a phi), the rest drew lines across
+/// the screen. `VICTORY_HAIR` (any value) has them run, as before.
+/// shortcut: left out.
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    const NAMES: [&[u8]; 18] = [
+        b"InterpolateStrand", b"HairStrand", b"CS_VisHair", b"PS_Smh", b"CS_InitSimBuffer",
+        b"CS_PreSkinSim", b"CS_SolvePer", b"CS_WavePerSpline", b"CS_EstimateStartPosition",
+        b"CS_CachePrev", b"CS_RestoreSimVelocity", b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories", b"CSGenerateHair", b"CS_CalculateFireVolumes",
+        b"CS_ProjDecalCut", b"CS_CullMaskPass", b"CS_LodBlend",
+    ];
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+        return false;
+    }
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -113,6 +149,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                hair: hair_strands(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -136,11 +174,15 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
 #[cfg(windows)]
 pub fn warm_selected(stage: &'static str, container: &[u8], compute: bool) -> Option<(bool, Option<bool>)> {
     let full = blake3::hash(container);
+    if hair_strands(container) {
+        return None;
+    }
     // Not through the table, which lets nothing go.
     let shader = Arc::new(Shader {
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        hair: false,
         translated: OnceLock::new(),
         ray_work: OnceLock::new(),
     });
@@ -495,7 +537,7 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || pipeline(this).shaders.iter().any(|shader| shader.hair) {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -586,6 +628,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| p.shaders.iter().any(|s| s.hair).then(|| "hair-strand program left out".to_owned()))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {

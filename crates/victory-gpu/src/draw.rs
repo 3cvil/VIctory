@@ -3461,10 +3461,14 @@ impl State {
             return false;
         }
         if builder && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: ray-tracing structure builder is off"));
             return false;
         }
         if crate::pipeline::walker_held(self.pipeline as This) {
             once!("an indirect dispatch that walks the BVH held back: the structure builder has not run whole");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: BVH walker held back"));
             return false;
         }
         const DRAW: u32 = 0;
