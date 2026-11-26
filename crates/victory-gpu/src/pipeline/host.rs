@@ -91,6 +91,109 @@ impl Default for GraphicsState {
     }
 }
 
+/// The state as bytes and back, for the book of pipelines a run used
+/// ([`super::book`]). The descriptions are plain C structures; the layout
+/// tag makes a build with another layout read nothing.
+fn put<T: Copy>(out: &mut Vec<u8>, v: &T) {
+    // SAFETY: a plain value viewed as bytes (padding, where there is any,
+    // is not read back as anything but padding).
+    out.extend_from_slice(unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) });
+}
+
+fn take<T: Copy>(bytes: &[u8], at: &mut usize) -> Option<T> {
+    let end = at.checked_add(std::mem::size_of::<T>())?;
+    let part = bytes.get(*at..end)?;
+    *at = end;
+    // SAFETY: `part` is `size_of::<T>()` bytes; the types are C structures of integers.
+    Some(unsafe { part.as_ptr().cast::<T>().read_unaligned() })
+}
+
+impl GraphicsState {
+    /// The layout tag: the sizes of the structures written as they are.
+    fn layout() -> u32 {
+        use std::mem::size_of;
+        (size_of::<D3D12_BLEND_DESC>() + 3 * size_of::<D3D12_RASTERIZER_DESC>()
+            + 7 * size_of::<D3D12_DEPTH_STENCIL_DESC>() + 11 * size_of::<D3D12_RT_FORMAT_ARRAY>()) as u32
+    }
+
+    pub(super) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1024);
+        put(&mut out, &Self::layout());
+        put(&mut out, &self.blend);
+        put(&mut out, &self.sample_mask);
+        put(&mut out, &self.rasterizer);
+        put(&mut out, &self.depth);
+        put(&mut out, &u8::from(self.depth_bounds));
+        put(&mut out, &self.strip_cut.0);
+        put(&mut out, &self.topology.0);
+        put(&mut out, &self.targets);
+        put(&mut out, &self.depth_format.0);
+        put(&mut out, &self.samples);
+        put(&mut out, &(self.inputs.len() as u32));
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            let name = name.as_bytes();
+            put(&mut out, &(name.len() as u16));
+            out.extend_from_slice(name);
+            put(&mut out, &e.SemanticIndex);
+            put(&mut out, &e.Format.0);
+            put(&mut out, &e.InputSlot);
+            put(&mut out, &e.AlignedByteOffset);
+            put(&mut out, &e.InputSlotClass.0);
+            put(&mut out, &e.InstanceDataStepRate);
+        }
+        out
+    }
+
+    pub(super) fn from_bytes(bytes: &[u8]) -> Option<GraphicsState> {
+        let at = &mut 0usize;
+        if take::<u32>(bytes, at)? != Self::layout() {
+            return None;
+        }
+        let mut g = GraphicsState {
+            blend: take(bytes, at)?,
+            sample_mask: take(bytes, at)?,
+            rasterizer: take(bytes, at)?,
+            depth: take(bytes, at)?,
+            depth_bounds: take::<u8>(bytes, at)? != 0,
+            strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(take(bytes, at)?),
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE(take(bytes, at)?),
+            targets: take(bytes, at)?,
+            depth_format: DXGI_FORMAT(take(bytes, at)?),
+            samples: take(bytes, at)?,
+            ..GraphicsState::default()
+        };
+        let count = take::<u32>(bytes, at)? as usize;
+        if count > 64 {
+            return None;
+        }
+        let mut raw = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = take::<u16>(bytes, at)? as usize;
+            let name = bytes.get(*at..at.checked_add(len)?)?;
+            *at += len;
+            let name = CString::new(name).ok()?;
+            let element = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR::null(),
+                SemanticIndex: take(bytes, at)?,
+                Format: DXGI_FORMAT(take(bytes, at)?),
+                InputSlot: take(bytes, at)?,
+                AlignedByteOffset: take(bytes, at)?,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(take(bytes, at)?),
+                InstanceDataStepRate: take(bytes, at)?,
+            };
+            raw.push((element, name));
+        }
+        // The names live in `names`' heap buffers, which a move of the vector does not move.
+        g.names = raw.iter().map(|(_, n)| n.clone()).collect();
+        g.inputs = raw
+            .iter()
+            .zip(&g.names)
+            .map(|((e, _), n)| D3D12_INPUT_ELEMENT_DESC { SemanticName: PCSTR(n.as_ptr().cast()), ..*e })
+            .collect();
+        (*at == bytes.len()).then_some(g)
+    }
+}
+
 impl GraphicsState {
     pub(super) fn writes_depth_only(&self) -> bool {
         self.targets.NumRenderTargets == 0

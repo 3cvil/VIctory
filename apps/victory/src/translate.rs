@@ -360,63 +360,97 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: cra
             }
         });
         let _stop = Stop(&finished, reporter.thread().clone());
-        for root in &paths {
-            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-                if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                    continue;
-                }
-                let Ok(data) = std::fs::read(entry.path()) else {
-                    continue;
-                };
-                let jobs = sources(&data);
-                let next = AtomicUsize::new(0);
-                std::thread::scope(|s| {
-                    for _ in 0..threads.min(jobs.len()) {
-                        s.spawn(|| {
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                let Some(bytes) = job.bytes() else { continue };
-                                let Ok(container) = Container::parse(&bytes) else { continue };
-                                // As the title passes it: no more than the container.
-                                let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
-                                let total = u32::from_le_bytes(total) as usize;
-                                let bytes = &bytes[..total.min(bytes.len())];
-                                let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
-                                if !lock(&seen).insert(blake3::hash(bytes)) {
-                                    continue;
-                                }
-                                let Ok(programs) = native_programs(dxil) else { continue };
-                                let stage = programs.iter().find_map(|p| match p.stage {
-                                    HwStage::Vs => Some("vertex"),
-                                    HwStage::Ps => Some("pixel"),
-                                    HwStage::Ms => Some("mesh"),
-                                    HwStage::Cs => Some("compute"),
-                                    _ => None,
-                                });
-                                let Some(stage) = stage else { continue };
-                                let compute = pipelines && stage == "compute";
-                                let Some((translated, pipeline)) = victory_hle::modules::d3d12x::warm_selected(stage, bytes, compute) else {
-                                    omitted.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                };
-                                let count = if translated { &done } else { &refused };
-                                count.fetch_add(1, Ordering::Relaxed);
-                                match pipeline {
-                                    Some(true) => made.fetch_add(1, Ordering::Relaxed),
-                                    Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
-                                    None => 0,
-                                };
+        // Files are read and scanned by a few loader threads while every
+        // other thread translates what they find, so a file with a few
+        // shaders, or one very large file, does not leave the others
+        // waiting (the loop used to scan a file, translate its shaders on
+        // all threads, and only then open the next: about two shaders a
+        // second in its tail). `VICTORY_WARM_LOADERS` (1 to 8, 2).
+        let loaders = std::env::var("VICTORY_WARM_LOADERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let files = Mutex::new(
+            paths
+                .iter()
+                .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
+                .filter(|e| e.file_type().is_file() && e.metadata().map_or(0, |m| m.len()) <= MAX_FILE)
+                .map(walkdir::DirEntry::into_path),
+        );
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(threads * 8);
+        let receive = Mutex::new(receive);
+        std::thread::scope(|work| {
+            for _ in 0..loaders {
+                let send = send.clone();
+                let (files, seen) = (&files, &seen);
+                work.spawn(move || {
+                    loop {
+                        let Some(path) = lock(files).next() else { break };
+                        let Ok(data) = std::fs::read(&path) else { continue };
+                        for job in sources(&data) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            // As the title passes it: no more than the container.
+                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
+                            let bytes = &bytes[..(u32::from_le_bytes(total) as usize).min(bytes.len())];
+                            if !lock(seen).insert(blake3::hash(bytes)) {
+                                continue;
                             }
-                        });
+                            if send.send(bytes.to_vec()).is_err() {
+                                return;
+                            }
+                        }
                     }
                 });
             }
-        }
+            drop(send);
+            for _ in 0..threads {
+                work.spawn(|| {
+                    loop {
+                        let next = lock(&receive).recv();
+                        let Ok(bytes) = next else { break };
+                        let Ok(container) = Container::parse(&bytes) else { continue };
+                        let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
+                        let Ok(programs) = native_programs(dxil) else { continue };
+                        let stage = programs.iter().find_map(|p| match p.stage {
+                            HwStage::Vs => Some("vertex"),
+                            HwStage::Ps => Some("pixel"),
+                            HwStage::Ms => Some("mesh"),
+                            HwStage::Cs => Some("compute"),
+                            _ => None,
+                        });
+                        let Some(stage) = stage else { continue };
+                        let compute = pipelines && stage == "compute";
+                        let Some((translated, pipeline)) = victory_hle::modules::d3d12x::warm_selected(stage, &bytes, compute) else {
+                            omitted.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        let count = if translated { &done } else { &refused };
+                        count.fetch_add(1, Ordering::Relaxed);
+                        match pipeline {
+                            Some(true) => made.fetch_add(1, Ordering::Relaxed),
+                            Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                            None => 0,
+                        };
+                    }
+                });
+            }
+        });
     });
     let seen_total = done.load(Ordering::Relaxed) + refused.load(Ordering::Relaxed);
     if seen_total > 0 {
         let _ = std::fs::write(&total_file, seen_total.to_string());
     }
     println!("{}", progress_line(started.elapsed().as_secs_f64(), seen_total, 0, Some(seen_total)));
+    if pipelines {
+        let book_started = std::time::Instant::now();
+        let (listed, made_graphics, refused_graphics) =
+            victory_hle::modules::d3d12x::warm_book(threads, &|| {});
+        println!(
+            "warm         {listed} graphics pipelines written down by earlier runs: {made_graphics} made, {refused_graphics} refused; {:.0} s",
+            book_started.elapsed().as_secs_f64()
+        );
+    }
     victory_hle::modules::d3d12x::save_pipeline_cache();
     println!(
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {} omitted by ray-tracing mode; {:.0} s",

@@ -57,6 +57,16 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The cache folder of the pipelines, once the host has one.
+pub(crate) fn dir() -> Option<&'static PathBuf> {
+    DIR.get()
+}
+
+/// Something to write at the next save changed outside the library.
+pub(crate) fn mark_changed() {
+    USED_CHANGED.store(true, Ordering::Relaxed);
+}
+
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
@@ -597,6 +607,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    super::book::save();
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
