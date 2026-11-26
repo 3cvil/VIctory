@@ -564,9 +564,25 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Held by a save from start to end.
+static SAVING: Mutex<()> = Mutex::new(());
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // One save at a time, from serialising to the last file: an older
+    // library never lands over a newer, nor beside another's early list.
+    // The periodic saves (after each pipeline a worker makes) are best
+    // effort: they leave it to the save running; shutdown's waits.
+    let _saving = if now {
+        SAVING.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match SAVING.try_lock() {
+            Ok(saving) => saving,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
@@ -771,6 +787,50 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    /// A save waits for the one running (the worker's and shutdown's do not
+    /// interleave their files).
+    #[test]
+    fn a_save_waits_for_the_save_running() {
+        let running = SAVING.lock().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let second = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                save(true);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(Ordering::SeqCst), "a second save ran under the first");
+        drop(running);
+        second.join().unwrap();
+    }
+
+    /// A periodic save finding one running returns at once: compile workers
+    /// call it after every pipeline and must not wait out a save's files.
+    #[test]
+    fn a_periodic_save_does_not_wait_for_the_save_running() {
+        let running = SAVING.lock().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let periodic = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                save(false);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let returned = done.load(Ordering::SeqCst);
+        drop(running);
+        periodic.join().unwrap();
+        assert!(returned, "a periodic save waited for the one running");
     }
 
     /// The bytes at `at` of the pattern the test below writes.
