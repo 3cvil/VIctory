@@ -165,6 +165,7 @@ mod tests {
             (FsrPreset::Quality, [2560, 1440]),
             (FsrPreset::Balanced, [2258, 1270]),
             (FsrPreset::Performance, [1920, 1080]),
+            (FsrPreset::Ultra, [1280, 720]),
         ] {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             let scanout = *field::<5>(&mut image, 0x0247_ad4a).unwrap();

@@ -26,6 +26,8 @@ mod debug_hud;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+pub mod dlss;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
@@ -58,6 +60,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+pub mod upscale;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
