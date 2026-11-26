@@ -39,6 +39,11 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod material_demand;
+#[cfg(windows)]
+mod port;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod prof;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -70,6 +75,11 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

@@ -12,6 +12,8 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
+pub use victory_gpu::frames_begun;
+
 pub mod modules;
 mod registry;
 pub mod runtime;

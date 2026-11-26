@@ -384,6 +384,76 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// (Neptune) Lock-free mirrors of the guards' protected and absent sets (`Guards::protected`,
+/// `Guards::absent`), written under the guards' lock with the sets: [`ask_once`] asks whether a
+/// range starts in view memory before each kernel asking, and behind the guards' lock it waited
+/// for every write fault and every guard being set or opened (1.1 s of 20 in a profile of a
+/// heavy scene). A look that comes before a change of the set is no worse than one made just
+/// before the lock is taken: a block guarded meanwhile makes the kernel asking fail (as for any
+/// view), and a block opened meanwhile is still view memory, which is not write-watched.
+const PART: usize = 1 << 16;
+
+struct Part([std::sync::atomic::AtomicU64; PART]);
+
+static PROTECTED: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+static ABSENT: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+fn part_of(table: &'static [std::sync::atomic::AtomicPtr<Part>; 1 << 16], page: usize, make: bool) -> Option<&'static Part> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let slot = table.get(page / PART)?;
+    let mut at = slot.load(Acquire);
+    if at.is_null() {
+        if !make {
+            return None;
+        }
+        let layout = std::alloc::Layout::new::<Part>();
+        // SAFETY: a layout of non-zero size; zeroed memory is a valid `Part`.
+        let fresh = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<Part>();
+        if fresh.is_null() {
+            return None;
+        }
+        match slot.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+            Ok(_) => at = fresh,
+            Err(other) => {
+                // SAFETY: ours alone, allocated with this layout just above.
+                unsafe { std::alloc::dealloc(fresh.cast(), layout) };
+                at = other;
+            }
+        }
+    }
+    // SAFETY: a part once made is never freed.
+    Some(unsafe { &*at })
+}
+
+fn mirror_set(table: &'static [std::sync::atomic::AtomicPtr<Part>; 1 << 16], block: usize, on: bool) {
+    if let Some(part) = part_of(table, block, on) {
+        part.0[block % PART].store(u64::from(on), std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn mirror_one(table: &'static [std::sync::atomic::AtomicPtr<Part>; 1 << 16], block: usize) -> bool {
+    part_of(table, block, false).is_some_and(|part| part.0[block % PART].load(std::sync::atomic::Ordering::Acquire) != 0)
+}
+
+fn protected_set(block: usize, on: bool) {
+    mirror_set(&PROTECTED, block, on);
+}
+
+fn protected_one(block: usize) -> bool {
+    mirror_one(&PROTECTED, block)
+}
+
+fn absent_set(block: usize, on: bool) {
+    mirror_set(&ABSENT, block, on);
+}
+
+fn absent_one(block: usize) -> bool {
+    mirror_one(&ABSENT, block)
+}
+
 /// Clean 64 KiB blocks, stored as disjoint, non-adjacent half-open runs.
 /// A cached buffer can cover thousands of consecutive protected blocks.
 #[derive(Default)]
@@ -486,10 +556,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (Neptune) Without the guards' lock: the tables mirror the sets ([`PROTECTED`], [`ABSENT`]).
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        // `VICTORY_WATCH_LOCKFREE=1` (off by default): the tables answer; else the guards do.
+        static FREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FREE.get_or_init(|| std::env::var_os("VICTORY_WATCH_LOCKFREE").is_some_and(|v| v == "1")) {
+            protected_one(first) || absent_one(first)
+        } else {
+            let g = guards();
+            g.protected.contains(&first) || g.absent.contains(&first)
+        }
     };
     if !known && !is_view(start, end) {
         return None;
@@ -515,6 +592,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                     continue;
                 }
                 g.absent.remove(&block);
+                absent_set(block, false);
             }
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -647,6 +725,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        protected_set(block, true);
     }
 }
 
@@ -667,6 +746,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
+        (from..to).for_each(|block| protected_set(block, true));
         g.clean.insert(from, to);
     };
     if set(from, to) {
@@ -678,6 +758,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+            absent_set(block, true);
         }
     }
 }
@@ -732,6 +813,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        protected_set(block, false);
         g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
@@ -925,10 +1007,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+        absent_set(block, false);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        protected_set(block, false);
         g.clean.remove(block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();

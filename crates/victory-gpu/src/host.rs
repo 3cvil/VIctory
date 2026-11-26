@@ -3740,6 +3740,8 @@ fn late_line(frames: f64) {
             );
         }
     }
+    crate::prof::line(frames);
+    crate::port::log(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -5563,6 +5565,9 @@ impl Host {
         crate::copystat::submission_begins();
         let was_working = working(true);
         submitting(1, runs.len());
+        // (Neptune) The stages of this submission, timed (`crate::prof`, VICTORY_SUBMIT_PROF=1).
+        crate::prof::count(crate::prof::C::Submissions, 1);
+        let mut lap = std::time::Instant::now();
         // Under the submission lock, before inspecting dependencies. A remap
         // racing preparation also invalidates this submission's old writes.
         crate::writeback::starting(STARTED.load(Ordering::Relaxed) + 1);
@@ -5580,6 +5585,7 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        lap = crate::prof::lap(crate::prof::S::SettleBefore, lap);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5596,10 +5602,12 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        lap = crate::prof::lap(crate::prof::S::Sweep, lap);
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        crate::prof::lap(crate::prof::S::MakeWaiting, lap);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5696,7 +5704,9 @@ impl Host {
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            let snap_lap = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            crate::prof::lap(crate::prof::S::Snapshots, snap_lap);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
@@ -5709,7 +5719,9 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        let card_began = std::time::Instant::now();
         let card = self.card_before(runs, flown);
+        crate::prof::lap(crate::prof::S::CardBefore, card_began);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -7023,6 +7035,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7030,6 +7043,9 @@ impl HostList {
                 }
                 Step::Fill(_) | Step::Fills(_) => {
                     let fills = step.fills();
+                    for f in fills {
+                        crate::port::filled(f.src, f.len);
+                    }
                     let bytes = fills.iter().map(|f| f.len).sum::<usize>();
                     let jobs = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]
@@ -8234,6 +8250,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        let _prof = crate::prof::Scope::new(crate::prof::S::Present);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
