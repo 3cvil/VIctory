@@ -264,6 +264,9 @@ struct Builder {
     whole: bool,
     /// One could not be made.
     off: bool,
+    /// It has run whole once: the structures were built
+    /// ([`walker_held`]).
+    ran: bool,
 }
 
 #[cfg(windows)]
@@ -271,7 +274,39 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
     off: false,
+    ran: false,
 });
+
+/// Whether a dispatch of `this`, a program that walks the ray-tracing
+/// structures (`image_bvh*_intersect_ray`), waits: the title has a
+/// structure builder, and it has not run whole yet (held back, turned off,
+/// or not allowed). The walk then reads whatever lies in the structures'
+/// memory, in a loop the title bounds at 65,535 steps a wave, which
+/// outlasts the host's GPU timeout: the device hung at world entry on
+/// hosts of 32-lane waves, where some builder programs were refused.
+///
+/// Only on hosts of 32-lane waves (NVIDIA); 64-lane hosts (AMD) are
+/// unchanged. `VICTORY_BVH_WALK_WAIT=0` turns it off.
+#[cfg(windows)]
+pub(crate) fn walker_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        victory_shader::emit::host_max_wave() == 32
+            && std::env::var_os("VICTORY_BVH_WALK_WAIT").is_none_or(|v| v != "0")
+    });
+    if !on || this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    let walks = *p
+        .walks
+        .get_or_init(|| p.shaders.iter().any(|s| ray_tracing::walks(s.stage, &s.container)));
+    if !walks {
+        return false;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    !b.pipelines.is_empty() && !b.ran
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -340,6 +375,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    b.ran = true;
     true
 }
 
@@ -401,6 +437,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// One of its programs walks the ray-tracing structures
+    /// ([`walker_held`]); found at its first dispatch.
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
     #[cfg(all(windows, feature = "diagnostics"))]
     builder_recorded: std::sync::atomic::AtomicBool,
 }
@@ -603,6 +643,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks: OnceLock::new(),
         #[cfg(all(windows, feature = "diagnostics"))]
         builder_recorded: std::sync::atomic::AtomicBool::new(false),
         shaders,

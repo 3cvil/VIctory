@@ -2374,6 +2374,14 @@ impl State {
             }
             return;
         }
+        // What walks the structures waits until the builder has built them.
+        if crate::pipeline::walker_held(self.pipeline as This) {
+            once!("a dispatch that walks the BVH held back: the structure builder has not run whole");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("walks the BVH before the structure builder has run whole".to_owned());
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -3453,6 +3461,10 @@ impl State {
             return false;
         }
         if builder && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if crate::pipeline::walker_held(self.pipeline as This) {
+            once!("an indirect dispatch that walks the BVH held back: the structure builder has not run whole");
             return false;
         }
         const DRAW: u32 = 0;
