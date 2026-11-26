@@ -187,9 +187,30 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// Low-RAM threshold (`VICTORY_RAM_TRIM_MB`, in MiB; off by default):
+/// while the machine's available physical memory is below it, [`sweep`]
+/// runs twice as often and trims the pool of idle host lists
+/// (`crate::list::trim_idle`), whose upload memory is system memory.
+pub(crate) fn ram_trim_bytes() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_RAM_TRIM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+    })
+}
+
+/// Whether available physical memory is below `VICTORY_RAM_TRIM_MB` now.
+pub(crate) fn ram_pressure() -> bool {
+    ram_trim_bytes().is_some_and(|limit| available_physical_ram().is_some_and(|avail| avail < limit))
+}
+
+/// Once a second (every 500 ms below `VICTORY_RAM_TRIM_MB`), before a
+/// submission starts: lets go of what nothing names any more (copies of
+/// windows of title memory, staging buffers, host copies of textures the
+/// title fills, and under that pressure idle host lists).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
@@ -201,7 +222,9 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    let pressure = ram_pressure();
+    let interval = if pressure { 500 } else { 1000 };
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -212,6 +235,9 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    if pressure {
+        crate::list::trim_idle();
+    }
 }
 
 /// Drops `object` once every submission running now has finished: at once
