@@ -3828,6 +3828,9 @@ fn readable_view(list: &HostList, kind: ResourceType, view: &View, placed: bool)
                     (true, View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
+                // `VICTORY_TEXTURE_MAX_DIM`: a reserved texture from its
+                // first level within the cap.
+                let first = first.max(crate::resource::sparse_first_cap(*resource as This));
                 ready = crate::texture::upload_from(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.

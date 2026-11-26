@@ -3594,11 +3594,14 @@ fn make(
                     && let Some((copy, ready)) = crate::resource::sparse_sample(resource)
                 {
                     let desc = desc.as_mut()?;
-                    let wanted = *sparse_mips(desc)?.0;
+                    // `VICTORY_TEXTURE_MAX_DIM`: levels finer than the cap
+                    // are never uploaded, so neither waited for nor shown.
+                    let cap = crate::resource::sparse_first_cap(resource);
+                    let wanted = (*sparse_mips(desc)?.0).max(cap);
                     *sampled = Some(SampledSrv { owner: resource as usize, copy, ready, wanted, blocked: false, ahead: false, ahead_write: None });
                     // SAFETY: a live host texture.
                     let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
-                    if !clamp_sparse_srv(desc, levels, ready?) {
+                    if !clamp_sparse_srv(desc, levels, ready?.max(cap)) {
                         return None;
                     }
                 }

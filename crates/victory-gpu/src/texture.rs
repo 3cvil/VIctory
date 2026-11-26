@@ -1677,6 +1677,33 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     Some(s)
 }
 
+/// Optional largest texture dimension (`VICTORY_TEXTURE_MAX_DIM`, e.g.
+/// `1024` or `2048`; off by default, at least 64). Only with levels on
+/// demand (`VICTORY_LEVELS_ON_DEMAND=1`): a reserved host texture
+/// ([`crate::tiles`]) is uploaded and shown from the first level no larger
+/// than this, so the finer levels get no tiles in the card's memory, no
+/// staging memory and no detiling. For 8 GB cards and 16 GB of RAM.
+pub(crate) fn max_dim() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.max(64))
+    })
+}
+
+/// The first level of a `width` x `height` texture of `mips` levels no
+/// larger than `cap` either way; the coarsest level if none is.
+pub(crate) fn capped_first_mip(width: u32, height: u32, mips: usize, cap: u32) -> usize {
+    let mut level = 0usize;
+    while level + 1 < mips && ((width >> level).max(1) > cap || (height >> level).max(1) > cap) {
+        level += 1;
+    }
+    level
+}
+
 #[cfg(test)]
 mod first_mip_tests {
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
@@ -1747,6 +1774,21 @@ mod first_mip_tests {
         // Updating the CPU staging lease makes even the same tail due again.
         copies = Default::default();
         assert!(copies.claim(3).is_some());
+    }
+
+    /// `VICTORY_TEXTURE_MAX_DIM`: the first level within the cap, never
+    /// past the coarsest.
+    #[test]
+    fn capped_first_mip_clamps_large_textures_and_keeps_the_coarsest_level() {
+        use super::capped_first_mip;
+        assert_eq!(capped_first_mip(4096, 4096, 13, 1024), 2);
+        assert_eq!(capped_first_mip(2048, 1024, 12, 1024), 1);
+        assert_eq!(capped_first_mip(1024, 2048, 12, 1024), 1);
+        assert_eq!(capped_first_mip(1024, 1024, 11, 1024), 0);
+        assert_eq!(capped_first_mip(512, 512, 10, 1024), 0);
+        assert_eq!(capped_first_mip(4096, 4096, 3, 256), 2);
+        assert_eq!(capped_first_mip(2048, 2048, 1, 512), 0);
+        assert_eq!(capped_first_mip(2048, 2048, 0, 512), 0);
     }
 
     /// A 2-D view's first mip is its fifth word; other views show all mips.

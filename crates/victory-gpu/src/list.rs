@@ -237,6 +237,28 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Under `VICTORY_RAM_TRIM_MB` pressure (`crate::host::ram_pressure`):
+/// keeps only a few idle host lists, and lets the rest go with the upload
+/// memory they keep.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    const KEEP: usize = 16;
+    let excess = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= KEEP {
+            return;
+        }
+        let excess = idle.0.split_off(KEEP);
+        let freed: u64 = excess.iter().map(|Idle(_, bytes)| *bytes).sum();
+        idle.1 = idle.1.saturating_sub(freed);
+        excess
+    };
+    let (count, freed) = (excess.len(), excess.iter().map(|Idle(_, bytes)| *bytes).sum::<u64>());
+    // Outside the lock: freeing lists and their allocators takes time.
+    drop(excess);
+    crate::host::trail(|| format!("ram trim: {count} idle host lists let go ({} KiB of upload memory)", freed >> 10));
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
