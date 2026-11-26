@@ -41,6 +41,9 @@ mod inplace;
 mod material_demand;
 #[cfg(windows)]
 mod port;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod prof;
 pub mod list;
 pub mod object;
 pub mod pipeline;
