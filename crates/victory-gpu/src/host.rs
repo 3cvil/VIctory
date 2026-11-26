@@ -4862,7 +4862,7 @@ impl Host {
                             continue;
                         };
                         for (lo, hi) in r.span.changed_ranges(p, mask) {
-                            if seen.insert((copy, lo, hi)) {
+                            if !crate::wc_back::skip_back(r.declared, (hi - lo) as u64) && seen.insert((copy, lo, hi)) {
                                 pieces.push((r.shadow.clone(), lo, hi, 0));
                                 unpacked += (hi - lo) as u64;
                             }
@@ -5148,7 +5148,7 @@ impl Host {
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
                 for (lo, hi) in r.span.changed_ranges(p, r.changed_pages(p, differs)) {
-                    if seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                    if !crate::wc_back::skip_back(r.declared, (hi - lo) as u64) && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                         pieces.push((i, lo, hi, total));
                         total += (hi - lo) as u64;
                     }

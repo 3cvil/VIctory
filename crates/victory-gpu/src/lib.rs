@@ -65,6 +65,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod wc_back;
+#[cfg(windows)]
 mod tiles;
 #[cfg(windows)]
 mod watch;
@@ -80,6 +82,8 @@ pub use host::on_failure;
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use wc_back::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
