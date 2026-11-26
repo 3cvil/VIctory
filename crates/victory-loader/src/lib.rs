@@ -26,6 +26,7 @@ mod console_insn;
 mod crash;
 #[cfg(windows)]
 pub mod frame_rate;
+#[cfg(windows)]
 mod hooks;
 pub mod prepare;
 pub mod resolution;
