@@ -71,6 +71,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A window in card memory the CPU maps ([`window_mapped_for`]): no
+    /// copy in the PC's memory at all.
+    mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -281,6 +284,101 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     buffer
 }
+
+/// The most bytes of windows outside buffers that lie in the card's own
+/// memory with no copy in the PC's (`VICTORY_WINDOWS_BAR_MB`; 0, the default,
+/// none): one buffer in a GPU upload heap (resizable BAR), which the CPU fills
+/// through the bus. Unlike [`window_card_most`] there is no CPU side, so the
+/// PC's memory shared with the card shrinks by every byte placed (the 16 GB
+/// laptop's world had 3.5 GB of windows, 1.4 GB of it never copied into).
+/// The CPU only writes windows: no shader is declared to write one; if one
+/// were, its snapshot and compare would read through the bus, right but slow
+/// (counted in the log).
+///
+/// Admission: a window goes there while the card's use stays this far under
+/// the budget DXGI gives the process (`VICTORY_WINDOWS_BAR_FREE_MB`; by
+/// default an eighth of the budget), so the title's textures keep their room.
+/// A window refused, or made where the device has no such heap, stays in the
+/// PC's memory as before. Comes before [`window_card_most`].
+fn window_mapped_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// Bytes alive of windows in card memory the CPU maps.
+static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Windows made in card memory the CPU maps, and those refused for the
+/// card's budget, since the start.
+static WINDOW_MAPPED_MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What the card keeps free of windows in card memory the CPU maps, given
+/// its `budget`.
+fn window_mapped_free(budget: u64) -> u64 {
+    static FREE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    FREE.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mb| mb << 20)
+    })
+    .unwrap_or(budget / 8)
+}
+
+/// A buffer for a window of `size` bytes in card memory the CPU maps, if it
+/// is to be there ([`window_mapped_most`]).
+fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let most = window_mapped_most();
+    if most == 0 {
+        return None;
+    }
+    let host = host()?;
+    if !host.mapped_card_memory() {
+        return None;
+    }
+    // No reading, no admission: the card's use is not known.
+    let [budget, used, ..] = host.video_memory()?;
+    if used + size + window_mapped_free(budget) > budget {
+        WINDOW_MAPPED_MADE[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let Some(made) = host.mapped_card_buffer(size) else {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    };
+    let n = WINDOW_MAPPED_MADE[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            made = n,
+            refused_for_the_budget = WINDOW_MAPPED_MADE[1].load(Ordering::Relaxed),
+            alive_mb = WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) >> 20,
+            most_mb = most >> 20,
+            card_budget_mb = budget >> 20,
+            card_used_mb = used >> 20,
+            "windows in card memory the CPU maps (VICTORY_WINDOWS_BAR_MB)"
+        );
+    }
+    Some(made)
+}
+
+/// For the memory line: windows in card memory the CPU maps: bytes alive,
+/// made and refused for the card's budget since the start, and snapshots
+/// read back through the bus.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_mapped_stats() -> [u64; 4] {
+    [
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        WINDOW_MAPPED_MADE[0].load(Ordering::Relaxed),
+        WINDOW_MAPPED_MADE[1].load(Ordering::Relaxed),
+        MAPPED_READS.load(Ordering::Relaxed),
+    ]
+}
+
+/// Snapshots of windows in card memory the CPU maps (a shader declared a
+/// write to one): each reads the window through the bus.
+static MAPPED_READS: AtomicU64 = AtomicU64::new(0);
 
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
@@ -1592,6 +1690,9 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.mapped {
+            WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -2010,6 +2111,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            mapped: false,
             place: None,
         }
     }
@@ -2072,6 +2174,13 @@ impl Shadow {
         if self.card.is_some() {
             pending.push(range);
             return;
+        }
+        if self.mapped && MAPPED_READS.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                start = format_args!("{:#x}", self.start),
+                len = self.len,
+                "a shader writes a window in card memory the CPU maps: its snapshot reads through the bus (slow; VICTORY_WINDOWS_BAR_MB)"
+            );
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
@@ -3428,6 +3537,20 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // In the card's memory the CPU maps, if asked for and there is room:
+    // one buffer, nothing in the PC's memory.
+    if let Some((buffer, data)) = window_mapped_for(len) {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.mapped = true;
+        let shadow = Arc::new(shadow);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3463,6 +3586,28 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+#[test]
+fn a_window_in_card_memory_the_cpu_maps_takes_the_titles_bytes() {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_GPU_UPLOAD};
+    let Some(host) = host() else { return };
+    let Some((buffer, data)) = host.mapped_card_buffer(2 * PAGE as u64) else {
+        eprintln!("no GPU upload heaps in the card's memory here");
+        return;
+    };
+    let mut heap = D3D12_HEAP_PROPERTIES::default();
+    // SAFETY: a live buffer and a local output.
+    unsafe { buffer.GetHeapProperties(Some(&mut heap), None) }.unwrap();
+    assert_eq!(heap.Type, D3D12_HEAP_TYPE_GPU_UPLOAD);
+    let guest = vec![0x5au8; 3 * PAGE];
+    let from = (guest.as_ptr() as usize).next_multiple_of(PAGE);
+    let shadow = Shadow::new(buffer, data, 0, from as u64, 2 * PAGE as u64);
+    assert_eq!(shadow.copy(from, from + 2 * PAGE), 2 * PAGE);
+    // SAFETY: inside the mapping; a read through the bus, slow but right.
+    let held = unsafe { std::slice::from_raw_parts(data, 2 * PAGE) };
+    assert!(held.iter().step_by(4096).all(|&b| b == 0x5a));
 }
 
 #[cfg(test)]
