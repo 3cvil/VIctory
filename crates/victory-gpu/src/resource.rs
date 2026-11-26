@@ -1382,8 +1382,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+        // `VICTORY_TEXTURE_MAX_DIM`: a texture larger than the cap is
+        // reserved too, to be given only the levels within it.
+        let capped = crate::texture::max_dim()
+            .is_some_and(|cap| r.desc.width.max(u64::from(r.desc.height)) > u64::from(cap));
         let sparse_candidate = matches!(r.backing, Backing::ViewAddress(_))
-            && r.host.coarse_view.load(Relaxed)
+            && (r.host.coarse_view.load(Relaxed) || capped)
             && r.desc.dimension == 3
             && r.desc.flags == 0
             && r.desc.depth_or_array_size == 1
@@ -2008,6 +2012,27 @@ pub(crate) fn existing_host_copy(this: This) -> Option<std::sync::Arc<HostTextur
         return None;
     }
     hosted(this, false).map(|made| made.0)
+}
+
+/// `VICTORY_TEXTURE_MAX_DIM`: the finest level of a reserved host texture
+/// ([`HostTexture::sparse`]) that is uploaded and shown. 0 without a cap,
+/// and for every other texture.
+#[cfg(windows)]
+pub(crate) fn sparse_first_cap(this: This) -> u32 {
+    let Some(cap) = crate::texture::max_dim() else { return 0 };
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    let sparse = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|(host, _)| host.sparse.is_some());
+    if !sparse {
+        return 0;
+    }
+    let width = u32::try_from(r.desc.width).unwrap_or(u32::MAX);
+    crate::texture::capped_first_mip(width, r.desc.height, usize::from(r.desc.mip_levels), cap) as u32
 }
 
 /// An existing sparse allocation and the finest mip whose copy fence completed.
