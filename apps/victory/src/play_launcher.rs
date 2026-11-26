@@ -158,7 +158,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .truncate(false)
         .share_mode(0)
         .open(state.join("launcher.lock"))
-        .context("Could not lock the launcher state. Check for another DexNom RayTime session.")?;
+        .context("Could not lock the launcher state. Check for another M1LK session.")?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let action = if warm { "warm" } else { "run" };
     let path = logs.join(format!("{action}-{started}-{}.log", std::process::id()));
@@ -311,7 +311,7 @@ fn preload(
         .arg(root)
         .stdout(Stdio::piped())
         .spawn()
-        .context("Could not start DexNom RayTime shader preload")?;
+        .context("Could not start M1LK shader preload")?;
     let stdout = worker
         .stdout
         .take()
@@ -365,7 +365,7 @@ pub(super) fn show_error(text: &str) {
         fn MessageBoxW(owner: *mut c_void, text: *const u16, title: *const u16, flags: u32) -> i32;
     }
     let text: Vec<_> = text.encode_utf16().chain([0]).collect();
-    let title: Vec<_> = "DexNom RayTime".encode_utf16().chain([0]).collect();
+    let title: Vec<_> = "M1LK".encode_utf16().chain([0]).collect();
     // SAFETY: the two strings are NUL terminated and live for the call.
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10) };
 }

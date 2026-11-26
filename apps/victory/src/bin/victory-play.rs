@@ -2,7 +2,7 @@
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("DexNom Runtime requires Windows.");
+    eprintln!("M1LK requires Windows.");
 }
 
 #[cfg(windows)]
