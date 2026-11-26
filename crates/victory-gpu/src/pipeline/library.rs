@@ -616,14 +616,21 @@ pub(crate) fn save(now: bool) {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
+            match serialise(&library.library, &tmp, size) {
+                Ok(()) => {
+                    library.added.store(0, Ordering::Relaxed);
+                    SAVED.store(size as u64, Ordering::Relaxed);
+                    size
+                }
+                Err(e) => {
+                    // The pipelines stay counted as added for a later save;
+                    // the early list is still written below, not lost with
+                    // the library's failure.
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    let _ = std::fs::remove_file(&tmp);
+                    0
+                }
             }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
         }
     };
     // With what earlier runs listed: a run that asks for no title pipeline
@@ -656,7 +663,11 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            // Left for a later save to write again.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
