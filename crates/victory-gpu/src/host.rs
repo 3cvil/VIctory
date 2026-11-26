@@ -5450,6 +5450,9 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        // Snapshot buffers a loading burst left in the pool go after an
+        // idle window.
+        crate::shadow::trim_snapshot_pool();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;

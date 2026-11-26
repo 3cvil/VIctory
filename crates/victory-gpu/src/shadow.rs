@@ -850,9 +850,56 @@ struct SnapshotPool {
     by_capacity: BTreeMap<usize, Vec<Vec<u8>>>,
     bytes: usize,
     count: usize,
+    /// Bytes of pooled buffers out in snapshots now, and the most of them
+    /// out at once in this window of [`POOL_IDLE_SUBMISSIONS`] submissions.
+    live_bytes: usize,
+    peak_bytes: usize,
+    window: u32,
 }
 
+/// Snapshot memory kept for reuse at most (the burst ceiling).
+const POOL_BYTES: usize = 512 << 20;
+/// Kept after an idle window whatever the recent demand.
+const POOL_SPARE_BYTES: usize = 32 << 20;
+/// Submissions per window of [`SnapshotPool::step_window`].
+const POOL_IDLE_SUBMISSIONS: u32 = 128;
+
 impl SnapshotPool {
+    /// A buffer of `capacity` bytes went out to a snapshot.
+    fn note_taken(&mut self, capacity: usize) {
+        self.live_bytes += capacity;
+        self.peak_bytes = self.peak_bytes.max(self.live_bytes);
+    }
+
+    /// Lets go of the smallest pooled buffers until at most `max_bytes`
+    /// are kept (the larger ones cost the most to make again).
+    fn trim_to(&mut self, max_bytes: usize) {
+        while self.bytes > max_bytes {
+            let Some(mut smallest) = self.by_capacity.first_entry() else { break };
+            let size = *smallest.key();
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+    }
+
+    /// Once a window of [`POOL_IDLE_SUBMISSIONS`] submissions: the pool is
+    /// trimmed to the most its snapshots had out at once in it (at least
+    /// [`POOL_SPARE_BYTES`]), so a loading burst's buffers do not stay for
+    /// the run. The burst ceiling stays [`POOL_BYTES`].
+    fn step_window(&mut self) {
+        self.window += 1;
+        if self.window >= POOL_IDLE_SUBMISSIONS {
+            let budget = self.peak_bytes.clamp(POOL_SPARE_BYTES, POOL_BYTES);
+            self.peak_bytes = self.live_bytes;
+            self.window = 0;
+            self.trim_to(budget);
+        }
+    }
+
     fn take(&mut self, n: usize) -> Option<Vec<u8>> {
         // A tiny snapshot must not monopolize the one large backing needed by a
         // later heap-wide write. Pick the smallest backing that fits instead.
@@ -869,9 +916,10 @@ impl SnapshotPool {
     }
 
     fn put(&mut self, buffer: Vec<u8>) {
-        const MAX_BYTES: usize = 512 << 20;
+        const MAX_BYTES: usize = POOL_BYTES;
         const MAX_COUNT: usize = 512;
         let capacity = buffer.capacity();
+        self.live_bytes = self.live_bytes.saturating_sub(capacity);
         if capacity == 0 || capacity > MAX_BYTES {
             return;
         }
@@ -900,17 +948,51 @@ static POOL: std::sync::LazyLock<Mutex<SnapshotPool>> =
     std::sync::LazyLock::new(|| Mutex::new(SnapshotPool::default()));
 
 fn pooled(n: usize) -> Vec<u8> {
-    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
-    reused.unwrap_or_else(|| Vec::with_capacity(n))
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let buffer = pool.take(n).unwrap_or_else(|| Vec::with_capacity(n));
+    pool.note_taken(buffer.capacity());
+    buffer
 }
 
 fn give_back(v: Vec<u8>) {
     POOL.lock().unwrap_or_else(|e| e.into_inner()).put(v);
 }
 
+/// Trims idle snapshot pool buffers past recent peak usage every
+/// [`POOL_IDLE_SUBMISSIONS`] submissions (called once per submission).
+pub(crate) fn trim_snapshot_pool() {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).step_window();
+}
+
 #[cfg(test)]
 mod snapshot_pool_tests {
-    use super::SnapshotPool;
+    use super::{POOL_IDLE_SUBMISSIONS, SnapshotPool};
+
+    #[test]
+    fn snapshot_pool_trims_after_idle_window() {
+        let mut pool = SnapshotPool::default();
+        let take = |pool: &mut SnapshotPool, n: usize| {
+            let buffer = pool.take(n).unwrap_or_else(|| Vec::with_capacity(n));
+            pool.note_taken(buffer.capacity());
+            buffer
+        };
+        let a = take(&mut pool, 32 << 20);
+        let b = take(&mut pool, 32 << 20);
+        pool.put(a);
+        pool.put(b);
+        assert_eq!(pool.count, 2);
+        for _ in 0..POOL_IDLE_SUBMISSIONS - 1 {
+            pool.step_window();
+            assert_eq!(pool.count, 2);
+        }
+        pool.step_window();
+        assert_eq!(pool.count, 2, "first window keeps peak 64 MiB");
+        for _ in 0..POOL_IDLE_SUBMISSIONS {
+            pool.step_window();
+        }
+        assert_eq!(pool.count, 1, "second idle window trims buffers above 32 MiB spare");
+        assert_eq!(pool.bytes, 32 << 20);
+    }
 
     #[test]
     fn a_batch_of_windows_reuses_each_backing_without_reusing_its_contents() {

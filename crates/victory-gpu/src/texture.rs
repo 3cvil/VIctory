@@ -528,14 +528,21 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left). The largest textures'
+/// buffers are not kept: one per thread, it stayed at the largest
+/// texture ever read for the run.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const KEEP: usize = 8 << 20;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        if read.capacity() > KEEP {
+            *read = Vec::new();
+        }
+        out
     })
 }
 
