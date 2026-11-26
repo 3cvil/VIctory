@@ -60,6 +60,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod wc_back;
+#[cfg(windows)]
 mod tiles;
 #[cfg(windows)]
 mod watch;
@@ -70,6 +72,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use wc_back::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
