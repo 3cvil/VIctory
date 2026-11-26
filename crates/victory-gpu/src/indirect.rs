@@ -96,9 +96,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
+#ifdef ZERO_GARBAGE
+        if (any(g > uint3(65535u, 1u, 1u))) {
+            g = uint3(0, 0, 0);
+        }
+#else
         if (ahead && g.x > 65535u) {
             g = uint3(0, 0, 0);
         }
+#endif
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
@@ -114,7 +120,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
+#ifdef ZERO_GARBAGE
+            // A record that does not fit leaves the budget as it was.
+            if (BUDGET - before < cost) break;
+            uint next = before + cost;
+#else
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+#endif
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
@@ -181,11 +193,25 @@ fn make() -> windows::core::Result<Clamp> {
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
+    // `VICTORY_INDIRECT_ZERO_GARBAGE=1`: unwritten (all-ones) mesh records
+    // are zeroed whether or not ahead of their draw, and a record over the
+    // budget no longer uses up what is left of it for the records after
+    // (`KevinPratap/ApexIV` 1acecac; `Marvisak/VIctory#1799`).
+    let zero_garbage = std::env::var_os("VICTORY_INDIRECT_ZERO_GARBAGE").is_some_and(|v| v == "1");
+    if zero_garbage {
+        tracing::info!("indirect clamp zeros oversized mesh records (VICTORY_INDIRECT_ZERO_GARBAGE=1)");
+    }
+    let source = if zero_garbage {
+        format!("#define ZERO_GARBAGE 1
+{SOURCE}")
+    } else {
+        SOURCE.to_string()
+    };
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
