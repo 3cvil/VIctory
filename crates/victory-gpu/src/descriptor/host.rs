@@ -956,6 +956,35 @@ pub(crate) fn probe_view_limit() {
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 const NULL_BLOCK: u32 = 1 << 16;
 
+/// The dynamic slots of a view heap whose null slot is `null`
+/// (`probe_view_limit`). [`DYNAMIC`], except on a host heap capped at
+/// [`PORTABLE_VIEWS`] (NVIDIA), where `VICTORY_DYNAMIC_SLOTS` may take more
+/// of them from the title's slots kept in place (at most half the heap;
+/// tables past the title's kept slots are made afresh in these anyway).
+/// With 2^18, 1,100-4,800 of 12,000-16,600 tables a frame were refused
+/// there, each a dropped draw; 524288 left 0-33 a frame. Hosts that take
+/// [`UNCAPPED_VIEWS`] (AMD) always keep [`DYNAMIC`].
+fn dynamic_slots(null: u32) -> u32 {
+    if null == 0 || null >= PORTABLE_VIEWS {
+        return DYNAMIC;
+    }
+    static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAPPED.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, (null / 2).max(DYNAMIC));
+        if slots != DYNAMIC {
+            tracing::warn!(
+                slots,
+                title_in_place = null.saturating_sub(slots),
+                "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS)"
+            );
+        }
+        slots
+    })
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -976,7 +1005,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -988,6 +1016,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),

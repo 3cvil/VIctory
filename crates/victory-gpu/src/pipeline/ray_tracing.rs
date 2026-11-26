@@ -160,6 +160,21 @@ fn classify(stage: &str, container: &[u8], mode: Policy) -> Work {
     Work::Other
 }
 
+/// Whether a compute container walks the ray-tracing structures
+/// (`image_bvh*_intersect_ray`): see [`super::walker_held`].
+pub(super) fn walks(stage: &str, container: &[u8]) -> bool {
+    if stage != "compute" {
+        return false;
+    }
+    let Ok(container) = Container::parse(container) else {
+        return false;
+    };
+    container
+        .part(FourCC::DXIL)
+        .and_then(|p| victory_shader::native_programs(p.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| traverses(&p.code)))
+}
+
 fn traverses(code: &[u8]) -> bool {
     // The fast scan excludes programs without either MIMG header. Only the
     // decoder can distinguish a real instruction from a literal or unreachable data.

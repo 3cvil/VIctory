@@ -419,7 +419,9 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    lower::take_lds_region();
     let original = emit_program(c, native, p, st, io, res);
+    let lds_region = lower::take_lds_region();
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -490,7 +492,12 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // On by default for a program that kept 64-lane waves only for an LDS write and read
+        // in one lane-branch region (`lower::take_lds_region`): taken wave-wide, those
+        // branches let the halves meet between the accesses; `widen` keeps that form only
+        // where it cannot hang (`lower::loops_together`), the reason for the losses above.
+        let wide_env = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_env.as_ref().is_some_and(|v| v == "1") || lds_region && wide_env.as_ref().is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -519,7 +526,9 @@ pub fn emit(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    // (each form in turn: `widen` refuses one where a barrier could hang, and
+                    // another form of the same program may have no such loop)
+                    for base in bases.into_iter().flatten() {
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
@@ -573,13 +582,14 @@ pub fn emit(
             }
         }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // Cross-lane code that needs every lane of the console wave where it stands (SCC of a
+    // mask operation joined with a scalar test behind a per-lane skip, as in the 32-lane
+    // trace programs; a lane read; a first-lane read): right once the wave takes the
+    // per-lane branches around it together ([`widen`]; the lowering has named the blocks
+    // that could not meet).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+            if needs_wave_wide(native.stage, what, lower::host_max_wave())
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
@@ -605,6 +615,14 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Whether a refusal is of cross-lane code that the wave-wide retry can fix: a mask read
+/// as data, or (on a host of 32-lane waves, where a console wave is two host waves) code
+/// that needs every lane of the console wave where it stands (a lane read, a first-lane
+/// read).
+pub(super) fn needs_wave_wide(stage: HwStage, what: &str, host_wave: u32) -> bool {
+    stage == HwStage::Cs && (what == lower::LANE_MASK || host_wave == 32 && lower::needs_every_lane(what))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -650,6 +668,33 @@ fn widen(
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            // Two host waves that meet at group barriers: only where no thread can leave the
+            // program while the others wait for it ([`lower::loops_together`]).
+            // A loop that could cut some threads short sits in a lane branch: the branches
+            // around it are taken wave-wide too, so that every lane runs it together.
+            let barriers = native.wave64 && lower::host_max_wave() == 32 && !wide.is_empty();
+            if barriers && matches!(&r, Ok((_, Some(32)))) {
+                const APART: ShaderError = ShaderError::Unsupported {
+                    offset: 0,
+                    what: "wave-wide branches with a loop not every lane runs together (a barrier could hang)",
+                };
+                let apart = lower::loops_together(p, &st).ok_or(APART)?;
+                if !apart.is_empty() {
+                    let more: Vec<usize> = lower::branches_around(&st, &apart)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|b| !wide.contains(b))
+                        .collect();
+                    if more.is_empty() {
+                        if why {
+                            eprintln!("WAVE64-WIDE refused: a loop not every lane enters and leaves together");
+                        }
+                        return Err(APART);
+                    }
+                    wide.extend(more);
+                    continue;
+                }
+            }
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
